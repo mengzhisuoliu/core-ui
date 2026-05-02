@@ -1,0 +1,1985 @@
+#include "page_state.h"
+#include "compiler.h"
+#include "svg_widget.h"
+#include "../event.h"
+#include "../expression/json.h"
+#include "../ui_context.h"
+#include "../ui_window.h"
+#ifdef small
+#undef small
+#endif
+#include "../controls.h"
+#include "../animation.h"
+#include "../asset.h"
+#include "../css/value.h"
+#include "../uix/expr_rewriter.h"
+#include "../uix/value_convert.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+
+namespace ui::page {
+
+namespace {
+
+std::wstring ToWide(const std::string& s) {
+    std::wstring r;
+    r.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        uint32_t cp = 0;
+        int len = 0;
+        if ((c & 0x80) == 0)          { cp = c;        len = 1; }
+        else if ((c & 0xE0) == 0xC0)  { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0)  { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0)  { cp = c & 0x07; len = 4; }
+        else                           { i++; continue; }
+        if (i + len > s.size()) break;
+        for (int k = 1; k < len; k++) {
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+        }
+        i += len;
+        if (cp < 0x10000) {
+            r += static_cast<wchar_t>(cp);
+        } else {
+            cp -= 0x10000;
+            r += static_cast<wchar_t>(0xD800 | (cp >> 10));
+            r += static_cast<wchar_t>(0xDC00 | (cp & 0x3FF));
+        }
+    }
+    return r;
+}
+
+std::string ToUtf8(const std::wstring& s) {
+    std::string r;
+    r.reserve(s.size() * 2);
+    for (size_t i = 0; i < s.size(); ++i) {
+        uint32_t cp = static_cast<uint32_t>(s[i]);
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.size()) {
+            uint32_t low = static_cast<uint32_t>(s[i + 1]);
+            if (low >= 0xDC00 && low <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                ++i;
+            }
+        }
+        if (cp < 0x80) {
+            r += static_cast<char>(cp);
+        } else if (cp < 0x800) {
+            r += static_cast<char>(0xC0 | (cp >> 6));
+            r += static_cast<char>(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            r += static_cast<char>(0xE0 | (cp >> 12));
+            r += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            r += static_cast<char>(0x80 | (cp & 0x3F));
+        } else {
+            r += static_cast<char>(0xF0 | (cp >> 18));
+            r += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+            r += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+            r += static_cast<char>(0x80 | (cp & 0x3F));
+        }
+    }
+    return r;
+}
+
+// C trampoline for `$t(key)`. Bound on the data object so user templates
+// see it as `this.$t(...)` after the rewriter pass. Reading `this_val.$locale`
+// through the proxy registers a dep on $locale so the binding re-runs whenever
+// SetLocale() updates it.
+JSValue JsTranslateTrampoline(JSContext* ctx, JSValueConst this_val,
+                               int argc, JSValueConst* argv) {
+    auto* rt = static_cast<ui::uix::ScriptRuntime*>(JS_GetContextOpaque(ctx));
+    if (!rt) return JS_UNDEFINED;
+    auto* page = static_cast<PageState*>(rt->GetUserData());
+    if (!page || argc < 1) return JS_UNDEFINED;
+
+    JSValue localeV = JS_GetPropertyStr(ctx, this_val, "$locale");
+    JS_FreeValue(ctx, localeV);
+
+    const char* key = JS_ToCString(ctx, argv[0]);
+    if (!key) return JS_NewString(ctx, "");
+    std::string out = page->Translate(key);
+    JS_FreeCString(ctx, key);
+    return JS_NewStringLen(ctx, out.data(), out.size());
+}
+
+// Find a transition spec on this widget for the given AnimProperty id.
+const Widget::TransitionSpec* FindTransition(const Widget* w, int propId) {
+    for (const auto& t : w->transitions) {
+        if (t.property == propId) return &t;
+    }
+    return nullptr;
+}
+
+void SetOpacityMaybeAnimated(Widget* w, float target) {
+    const auto* t = FindTransition(w, 0);
+    if (t && std::abs(w->opacity - target) > 0.001f) {
+        Animations().Animate(w, AnimProperty::Opacity, w->opacity, target,
+                             t->durationMs, static_cast<EasingFunction>(t->easing));
+    } else {
+        w->opacity = target;
+    }
+}
+
+void SetWidthMaybeAnimated(Widget* w, float target) {
+    const auto* t = FindTransition(w, 3);
+    if (t && std::abs(w->fixedW - target) > 0.5f && w->fixedW > 0) {
+        Animations().Animate(w, AnimProperty::Width, w->fixedW, target,
+                             t->durationMs, static_cast<EasingFunction>(t->easing));
+    } else {
+        w->fixedW = target;
+        ui::RequestLayout();
+    }
+}
+
+void SetHeightMaybeAnimated(Widget* w, float target) {
+    const auto* t = FindTransition(w, 4);
+    if (t && std::abs(w->fixedH - target) > 0.5f && w->fixedH > 0) {
+        Animations().Animate(w, AnimProperty::Height, w->fixedH, target,
+                             t->durationMs, static_cast<EasingFunction>(t->easing));
+    } else {
+        w->fixedH = target;
+        ui::RequestLayout();
+    }
+}
+
+void SetBgMaybeAnimated(Widget* w, const D2D1_COLOR_F& target) {
+    const auto* tA = FindTransition(w, 8);
+    if (tA) {
+        auto easing = static_cast<EasingFunction>(tA->easing);
+        Animations().Animate(w, AnimProperty::BgColorR, w->bgColor.r, target.r, tA->durationMs, easing);
+        Animations().Animate(w, AnimProperty::BgColorG, w->bgColor.g, target.g, tA->durationMs, easing);
+        Animations().Animate(w, AnimProperty::BgColorB, w->bgColor.b, target.b, tA->durationMs, easing);
+        Animations().Animate(w, AnimProperty::BgColorA, w->bgColor.a, target.a, tA->durationMs, easing);
+    } else {
+        w->bgColor = target;
+    }
+}
+
+}  // namespace
+
+PageState::PageState() = default;
+PageState::~PageState() {
+    DetachQuickJS();
+}
+
+// ---- Reactive state writes ------------------------------------------------
+//
+// All writes route through the JS proxy's set-trap when the runtime is
+// attached. Without a runtime (pre-attach Set* calls — typical for callers
+// that prime state via ui_page_set_int before ui_page_open_window), we
+// stash the value and replay it inside AttachQuickJS… that path isn't
+// implemented here; callers should attach first. The C API guards against
+// nullptr state already.
+
+void PageState::SetBool(const std::string& name, bool v) {
+    if (!jsRt_ || JS_IsUndefined(jsState_)) return;
+    JS_SetPropertyStr(jsRt_->ctx(), jsState_, name.c_str(),
+                      JS_NewBool(jsRt_->ctx(), v));
+}
+
+void PageState::SetNumber(const std::string& name, double v) {
+    if (!jsRt_ || JS_IsUndefined(jsState_)) return;
+    JS_SetPropertyStr(jsRt_->ctx(), jsState_, name.c_str(),
+                      JS_NewFloat64(jsRt_->ctx(), v));
+}
+
+void PageState::SetString(const std::string& name, const std::string& v) {
+    if (!jsRt_ || JS_IsUndefined(jsState_)) return;
+    JS_SetPropertyStr(jsRt_->ctx(), jsState_, name.c_str(),
+                      JS_NewStringLen(jsRt_->ctx(), v.data(), v.size()));
+}
+
+void PageState::SetValue(const std::string& name, ui::expr::Value v) {
+    // Primitive types route to the typed setters above. Object / Array are
+    // serialized to JSON then JS_ParseJSON — covers ui_page_set_json's
+    // "set arbitrary structured data" use case without us hand-rolling an
+    // expr::Value → JSValue converter.
+    if (!jsRt_ || JS_IsUndefined(jsState_)) return;
+    JSContext* ctx = jsRt_->ctx();
+    if (v.IsBool())   { SetBool(name, v.Bool());     return; }
+    if (v.IsNumber()) { SetNumber(name, v.Number()); return; }
+    if (v.IsString()) { SetString(name, v.ToString()); return; }
+    if (v.IsNull()) {
+        JS_SetPropertyStr(ctx, jsState_, name.c_str(), JS_NULL);
+        return;
+    }
+    std::string json = ui::expr::EmitJson(v);
+    JSValue parsed = JS_ParseJSON(ctx, json.c_str(), json.size(), "<set_value>");
+    if (JS_IsException(parsed)) {
+        JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+        return;
+    }
+    JS_SetPropertyStr(ctx, jsState_, name.c_str(), parsed);
+}
+
+bool PageState::GetValue(const std::string& name, ui::expr::Value& out) const {
+    if (!jsRt_ || JS_IsUndefined(jsState_)) return false;
+    JSContext* ctx = jsRt_->ctx();
+    JSValue v = JS_GetPropertyStr(ctx, jsState_, name.c_str());
+    if (JS_IsUndefined(v) || JS_IsException(v)) {
+        JS_FreeValue(ctx, v);
+        return false;
+    }
+    out = ui::uix::JSValueToExprValue(ctx, v);
+    JS_FreeValue(ctx, v);
+    return true;
+}
+
+// ---- i18n ------------------------------------------------------------------
+
+std::string PageState::Translate(const std::string& key) const {
+    auto it = i18nTables_.find(currentLocale_);
+    if (it != i18nTables_.end()) {
+        auto k = it->second.find(key);
+        if (k != it->second.end()) return k->second;
+    }
+    return key;
+}
+
+void PageState::LoadTranslations(const std::string& locale,
+                                 const std::unordered_map<std::string, std::string>& pairs) {
+    i18nTables_[locale] = pairs;
+}
+
+void PageState::SetLocale(const std::string& locale) {
+    if (locale == currentLocale_) return;
+    currentLocale_ = locale;
+    // Mirror onto the proxy's $locale slot — set-trap fires, every binding
+    // that called $t() (which reads $locale internally) re-evaluates.
+    SetString("$locale", locale);
+}
+
+// ---- Lifecycle hooks --------------------------------------------------
+
+void PageState::OnWidgetMount(const std::string& widgetId,
+                               std::function<void(Widget*)> cb) {
+    if (widgetId.empty()) return;
+    lifecycleHooks_[widgetId].onMount = cb;
+    // Fire immediately if a matching widget is already in the live tree.
+    // Typical call order is `ui_page_load_* → ui_page_on_widget_mount →
+    // ui_page_open_window`, so by the time the hook is registered the
+    // initial mount has long since happened — without this catch-up the
+    // hook would only ever fire on later v-if / v-for rebuilds. Matches
+    // Vue's `watchEffect(immediate)` semantics for "is currently mounted".
+    if (cb && page_.root) {
+        if (Widget* w = page_.root->FindById(widgetId)) {
+            cb(w);
+        }
+    }
+}
+
+void PageState::OnWidgetUnmount(const std::string& widgetId,
+                                  std::function<void(Widget*)> cb) {
+    if (widgetId.empty()) return;
+    lifecycleHooks_[widgetId].onUnmount = std::move(cb);
+}
+
+void PageState::DispatchMountHooks(Widget* root) {
+    if (!root || lifecycleHooks_.empty()) return;
+    std::function<void(Widget*)> walk = [&](Widget* w) {
+        if (!w) return;
+        if (!w->id.empty()) {
+            auto it = lifecycleHooks_.find(w->id);
+            if (it != lifecycleHooks_.end() && it->second.onMount) {
+                it->second.onMount(w);
+            }
+        }
+        for (auto& c : w->Children()) walk(c.get());
+    };
+    walk(root);
+}
+
+void PageState::DispatchUnmountHooks(Widget* root) {
+    if (!root || lifecycleHooks_.empty()) return;
+    std::function<void(Widget*)> walk = [&](Widget* w) {
+        if (!w) return;
+        if (!w->id.empty()) {
+            auto it = lifecycleHooks_.find(w->id);
+            if (it != lifecycleHooks_.end() && it->second.onUnmount) {
+                it->second.onUnmount(w);
+            }
+        }
+        for (auto& c : w->Children()) walk(c.get());
+    };
+    walk(root);
+}
+
+void PageState::RefreshThemeStyles() {
+    if (!page_.cssVars) return;
+    RebuildThemeVars(*page_.cssVars);
+    // Walk the live widget tree and re-cascade. recomputeStyle reads
+    // cssVars via the captured shared_ptr, which now points at the rebuilt
+    // theme palette — so every `var(--xxx)` resolves against new colors.
+    std::function<void(Widget*)> walk = [&](Widget* w) {
+        if (!w) return;
+        if (w->recomputeStyle) w->recomputeStyle(w->lastStateBits);
+        for (auto& c : w->Children()) walk(c.get());
+    };
+    walk(page_.root.get());
+    ui::GetContext().InvalidateAllWindows();
+}
+
+// ---- Binding application: JSValue → Widget property ------------------------
+
+void PageState::ApplyBindingToWidget(Widget* w, const std::string& prop, const ui::expr::Value& v) {
+    if (!w) return;
+
+    // Tail-call invalidator: every binding application needs to repaint
+    // (LabelWidget::SetText etc. only mutate state without their own
+    // InvalidateRect, so a click-handler-driven count++ wouldn't visibly
+    // update until the next unrelated event provoked a redraw).
+    // Also kicks per-widget animation timers so a programmatic state change
+    // that flips a Toggle/CheckBox into animating_=true actually starts
+    // ticking even outside a mouse/key event handler.
+    struct InvalidateOnExit {
+        ~InvalidateOnExit() {
+            ui::GetContext().InvalidateAllWindows();
+            ui::GetContext().UpdateAnimTimers();
+        }
+    } _invalidate;
+
+    // SVG shape attribute: "shape[N].<attr>" routes to SvgWidget::SetShapeProperty.
+    if (prop.size() > 6 && prop.compare(0, 6, "shape[") == 0) {
+        size_t close = prop.find(']', 6);
+        if (close != std::string::npos && close + 1 < prop.size() && prop[close + 1] == '.') {
+            size_t idx = 0;
+            try { idx = (size_t)std::stoul(prop.substr(6, close - 6)); } catch (...) { return; }
+            std::string name = prop.substr(close + 2);
+            if (auto* svg = dynamic_cast<SvgWidget*>(w)) {
+                svg->SetShapeProperty(idx, name, v.ToString());
+            }
+        }
+        return;
+    }
+
+    if (prop == "text") {
+        if (auto* lbl = dynamic_cast<LabelWidget*>(w))  lbl->SetText(ToWide(v.ToString()));
+        else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetText(ToWide(v.ToString()));
+        return;
+    }
+    if (prop == "class") {
+        std::vector<std::string> tokens;
+        std::string s = v.ToString();
+        std::string tok;
+        for (char c : s) {
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!tok.empty()) { tokens.push_back(std::move(tok)); tok.clear(); }
+            } else tok += c;
+        }
+        if (!tok.empty()) tokens.push_back(std::move(tok));
+        w->dynamicClasses = std::move(tokens);
+        std::function<void(Widget*)> refresh = [&](Widget* x) {
+            if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+            for (auto& c : x->Children()) refresh(c.get());
+        };
+        refresh(w);
+        return;
+    }
+    if (prop == "visible") {
+        bool nv = v.ToBool();
+        if (w->visible != nv) {
+            w->visible = nv;
+            // visible flips ⇒ widget participates in flex layout differently
+            // (invisible siblings are skipped in DoLayout). Without a relayout
+            // the freshly-shown widget keeps the zero rect it got while
+            // hidden, so it stays invisible from the user's POV — matches the
+            // reported `:visible="flag"` reactive bug.
+            ui::RequestLayout();
+        }
+        return;
+    }
+    if (prop == "opacity")  { SetOpacityMaybeAnimated(w, static_cast<float>(v.ToNumber())); return; }
+    if (prop == "bg-color" || prop == "bgColor" || prop == "background" || prop == "background-color") {
+        ui::css::Color c;
+        if (ui::css::ParseColor(v.ToString(), c)) {
+            SetBgMaybeAnimated(w, D2D1_COLOR_F{c.r, c.g, c.b, c.a});
+        }
+        return;
+    }
+    if (prop == "color") {
+        ui::css::Color c;
+        if (ui::css::ParseColor(v.ToString(), c)) {
+            D2D1_COLOR_F d2d{c.r, c.g, c.b, c.a};
+            if (auto* lbl = dynamic_cast<LabelWidget*>(w)) lbl->TextColor(d2d);
+            else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) btn->SetTextColor(d2d);
+        }
+        return;
+    }
+    if (prop == "enabled") {
+        bool nv = v.ToBool();
+        if (w->enabled != nv) {
+            w->enabled = nv;
+            // Re-cascade so any `:disabled` selector flips its match. Without
+            // this the widget's color/cursor stay stuck at the previous state
+            // until some unrelated event triggers a recomputeStyle.
+            std::function<void(Widget*)> refresh = [&](Widget* x) {
+                if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+                for (auto& c : x->Children()) refresh(c.get());
+            };
+            refresh(w);
+        }
+        return;
+    }
+    if (prop == "width")      { SetWidthMaybeAnimated(w, static_cast<float>(v.ToNumber())); return; }
+    if (prop == "height")     { SetHeightMaybeAnimated(w, static_cast<float>(v.ToNumber())); return; }
+    if (prop == "min-width" || prop == "minWidth") {
+        w->minW = static_cast<float>(v.ToNumber()); ui::RequestLayout(); return;
+    }
+    if (prop == "max-width" || prop == "maxWidth") {
+        w->maxW = static_cast<float>(v.ToNumber()); ui::RequestLayout(); return;
+    }
+    if (prop == "min-height" || prop == "minHeight") {
+        w->minH = static_cast<float>(v.ToNumber()); ui::RequestLayout(); return;
+    }
+    if (prop == "max-height" || prop == "maxHeight") {
+        w->maxH = static_cast<float>(v.ToNumber()); ui::RequestLayout(); return;
+    }
+    if (prop == "src") {
+        if (auto* img = dynamic_cast<ImageWidget*>(w)) {
+            img->SetSrc(v.ToString());
+            ui::RequestLayout();
+        }
+        return;
+    }
+    if (prop == "icon") {
+        if (auto* btn = dynamic_cast<ButtonWidget*>(w)) {
+            btn->SetIcon(ToWide(v.ToString()));
+        }
+        return;
+    }
+    if (prop == "wrap") {
+        if (auto* lbl = dynamic_cast<LabelWidget*>(w)) {
+            lbl->SetWrap(v.ToBool());
+            ui::RequestLayout();
+        }
+        return;
+    }
+
+    if (prop == "selected" || prop == "checked" || prop == "on") {
+        bool b = v.ToBool();
+        // Use animated setters so the toggle/checkbox/radio glides between
+        // states. SetOn/SetChecked/SetSelected early-return when on_==v, so
+        // the round-trip after a click (OnMouseUp already flipped the local
+        // state, then JS state update echoes back) is a no-op and the
+        // animation kicked off in OnMouseUp keeps playing instead of being
+        // snapped to the target by an Immediate setter.
+        if (auto* rb = dynamic_cast<RadioButtonWidget*>(w))      rb->SetSelectedFromBinding(b);
+        else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w))    cb->SetCheckedFromBinding(b);
+        else if (auto* tg = dynamic_cast<ToggleWidget*>(w))      tg->SetOnFromBinding(b);
+        return;
+    }
+    if (prop == "value") {
+        if (auto* ti = dynamic_cast<TextInputWidget*>(w)) {
+            ti->SetText(ToWide(v.ToString()));
+        } else if (auto* ta = dynamic_cast<TextAreaWidget*>(w)) {
+            ta->SetText(ToWide(v.ToString()));
+        } else if (auto* slider = dynamic_cast<SliderWidget*>(w)) {
+            slider->SetValue(static_cast<float>(v.ToNumber()));
+        } else if (auto* pb = dynamic_cast<ProgressBarWidget*>(w)) {
+            pb->SetValueFromBinding(static_cast<float>(v.ToNumber()));
+        } else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w)) {
+            cb->SetCheckedFromBinding(v.ToBool());
+        } else if (auto* tg = dynamic_cast<ToggleWidget*>(w)) {
+            tg->SetOnFromBinding(v.ToBool());
+        } else if (auto* rb = dynamic_cast<RadioButtonWidget*>(w)) {
+            rb->SetSelectedFromBinding(v.ToBool());
+        } else if (auto* nb = dynamic_cast<NumberBoxWidget*>(w)) {
+            nb->SetValue(static_cast<float>(v.ToNumber()));
+        } else if (auto* combo = dynamic_cast<ComboBoxWidget*>(w)) {
+            if (v.IsNumber()) combo->SetSelectedIndex(static_cast<int>(v.ToNumber()));
+        }
+        return;
+    }
+    (void)v;
+}
+
+// ---- Menus -----------------------------------------------------------------
+
+void PageState::WireMenus() {
+    menus_.clear();
+    menuById_.clear();
+    triggers_.clear();
+    menuItemHandlers_.clear();
+    if (page_.menus.empty()) return;
+
+    auto toWide = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return {};
+        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+        if (len <= 0) return {};
+        std::wstring w(len, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
+        return w;
+    };
+    auto resolveTrigger = [this](const std::string& sel) -> Widget* {
+        if (sel.size() < 2 || sel[0] != '#') return nullptr;
+        if (!page_.root) return nullptr;
+        return page_.root->FindById(sel.substr(1));
+    };
+
+    for (const auto& cm : page_.menus) {
+        auto menu = std::make_shared<ContextMenu>();
+        for (const auto& mi : cm.items) {
+            if (mi.separator) { menu->AddSeparator(); continue; }
+            std::wstring text = toWide(mi.text);
+            if (mi.shortcut.empty())
+                menu->AddItem(mi.itemId, text);
+            else
+                menu->AddItemEx(mi.itemId, text, toWide(mi.shortcut), "", nullptr);
+            if (!mi.onClick.empty()) {
+                menuItemHandlers_[mi.itemId] = mi.onClick;
+            }
+        }
+        menus_.push_back(menu);
+        if (!cm.id.empty()) menuById_[cm.id] = menu.get();
+
+        Widget* trigger = resolveTrigger(cm.triggerSelector);
+        if (!trigger) continue;
+        triggers_.push_back({trigger, menu.get(), cm.triggerEvent == "rclick"});
+    }
+}
+
+void PageState::WireSubtreeMenus(const std::vector<CompiledMenu>& subMenus,
+                                  std::vector<std::shared_ptr<ContextMenu>>& outMenus) {
+    if (subMenus.empty()) return;
+    auto toWide = [](const std::string& s) -> std::wstring {
+        if (s.empty()) return {};
+        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+        if (len <= 0) return {};
+        std::wstring w(len, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], len);
+        return w;
+    };
+    auto resolveTrigger = [this](const std::string& sel) -> Widget* {
+        if (sel.size() < 2 || sel[0] != '#') return nullptr;
+        if (!page_.root) return nullptr;
+        return page_.root->FindById(sel.substr(1));
+    };
+
+    ui::UiWindowImpl* winImpl = nullptr;
+    ui::Renderer* renderer = ui::g_activeRenderer;
+    if (winHandle_) {
+        auto* w = ui::GetContext().GetWindow(winHandle_);
+        if (w) { winImpl = w; renderer = &w->GetRenderer(); }
+    }
+
+    std::function<std::shared_ptr<ContextMenu>(const CompiledMenu&)> buildOne;
+    buildOne = [&](const CompiledMenu& cm) -> std::shared_ptr<ContextMenu> {
+        auto menu = std::make_shared<ContextMenu>();
+        for (const auto& mi : cm.items) {
+            if (mi.separator) { menu->AddSeparator(); continue; }
+            if (mi.submenu) {
+                auto sub = buildOne(*mi.submenu);
+                outMenus.push_back(sub);
+                menu->AddSubmenu(toWide(mi.text), sub);
+                continue;
+            }
+            std::wstring text = toWide(mi.text);
+            std::wstring shortcut = mi.shortcut.empty() ? L"" : toWide(mi.shortcut);
+
+            ComPtr<ID2D1Bitmap> bmp;
+            if (!mi.imgSrc.empty() && renderer) {
+                const void* bytes = nullptr; size_t size = 0;
+                ui::asset::DataOwnerPtr owner;
+                if (ui::asset::Resolve(mi.imgSrc, &bytes, &size, &owner) && bytes) {
+                    bmp = renderer->LoadImageFromBytes(bytes, size);
+                }
+            }
+
+            if (bmp) {
+                menu->AddItemBitmap(mi.itemId, text, shortcut, bmp);
+            } else if (!mi.iconSvg.empty() && renderer) {
+                menu->AddItemEx(mi.itemId, text, shortcut, mi.iconSvg, renderer);
+            } else if (shortcut.empty()) {
+                menu->AddItem(mi.itemId, text);
+            } else {
+                menu->AddItemEx(mi.itemId, text, shortcut, "", nullptr);
+            }
+
+            if (mi.hasColor) {
+                D2D1_COLOR_F c = { mi.color_r, mi.color_g, mi.color_b, mi.color_a };
+                menu->SetLastItemColor(c);
+            }
+            if (!mi.onClick.empty()) {
+                menuItemHandlers_[mi.itemId] = mi.onClick;
+            }
+        }
+        return menu;
+    };
+
+    for (const auto& cm : subMenus) {
+        auto menu = buildOne(cm);
+        outMenus.push_back(menu);
+        if (!cm.id.empty()) menuById_[cm.id] = menu.get();
+
+        Widget* trigger = resolveTrigger(cm.triggerSelector);
+        if (!trigger) continue;
+        bool rclick = (cm.triggerEvent == "rclick");
+        triggers_.push_back({trigger, menu.get(), rclick});
+
+        if (winImpl && !rclick) {
+            ContextMenu* rawMenu = menu.get();
+            Widget* trig = trigger;
+            auto* wp = winImpl;
+            trigger->onClick = [wp, trig, rawMenu]() {
+                wp->ShowMenu(rawMenu->shared_from_this(),
+                             trig->rect.left, trig->rect.bottom);
+            };
+        }
+    }
+
+    if (winImpl) {
+        bool hasRclick = false;
+        for (const auto& t : triggers_) if (t.rclick) { hasRclick = true; break; }
+        if (hasRclick) {
+            std::vector<TriggerSpec> rclickList;
+            for (const auto& t : triggers_) if (t.rclick) rclickList.push_back(t);
+            auto* wp = winImpl;
+            auto prev = wp->onRightClick;
+            wp->onRightClick = [wp, rclickList, prev](float x, float y) {
+                for (const auto& t : rclickList) {
+                    if (!t.triggerElement || !t.menu) continue;
+                    if (t.triggerElement->Contains(x, y)) {
+                        wp->ShowMenu(t.menu->shared_from_this(), x, y);
+                        return;
+                    }
+                }
+                if (prev) prev(x, y);
+            };
+        }
+    }
+}
+
+void PageState::AttachWindow(uint64_t winHandle) {
+    winHandle_ = winHandle;
+    auto& ctx = ui::GetContext();
+    auto win = ctx.GetWindow(winHandle);
+    if (!win) return;
+    auto* winImpl = win;
+
+    for (const auto& t : triggers_) {
+        if (t.rclick || !t.triggerElement || !t.menu) continue;
+        Widget* trig = t.triggerElement;
+        ContextMenu* rawMenu = t.menu;
+        auto* wp = winImpl;
+        t.triggerElement->onClick = [wp, trig, rawMenu]() {
+            wp->ShowMenu(rawMenu->shared_from_this(), trig->rect.left, trig->rect.bottom);
+        };
+    }
+
+    bool hasRclick = false;
+    for (const auto& t : triggers_) if (t.rclick) { hasRclick = true; break; }
+    if (hasRclick) {
+        auto prev = win->onRightClick;
+        std::vector<TriggerSpec> rclickList;
+        for (const auto& t : triggers_) if (t.rclick) rclickList.push_back(t);
+        auto* wp = winImpl;
+        win->onRightClick = [wp, rclickList, prev](float x, float y) {
+            for (const auto& t : rclickList) {
+                if (!t.triggerElement || !t.menu) continue;
+                if (t.triggerElement->Contains(x, y)) {
+                    wp->ShowMenu(t.menu->shared_from_this(), x, y);
+                    return;
+                }
+            }
+            if (prev) prev(x, y);
+        };
+    }
+
+    // <menuitem onclick="methodName"> — dispatch to the JS method bound on
+    // jsState_. Methods{} from `export default` were merged onto dataObj
+    // before MakeReactive, so jsState_.<name> resolves through the proxy
+    // to the JSFunction we then call with this=jsState_.
+    auto prev = win->onMenuItemClick;
+    PageState* self = this;
+    win->onMenuItemClick = [self, prev](int itemId) {
+        auto it = self->menuItemHandlers_.find(itemId);
+        if (it != self->menuItemHandlers_.end() && self->jsRt_ &&
+            !JS_IsUndefined(self->jsState_)) {
+            JSContext* ctx = self->jsRt_->ctx();
+            JSValue fn = JS_GetPropertyStr(ctx, self->jsState_, it->second.c_str());
+            if (JS_IsFunction(ctx, fn)) {
+                JSValue r = JS_Call(ctx, fn, self->jsState_, 0, nullptr);
+                if (JS_IsException(r)) {
+                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                }
+                JS_FreeValue(ctx, r);
+                JS_FreeValue(ctx, fn);
+                return;
+            }
+            JS_FreeValue(ctx, fn);
+        }
+        if (prev) prev(itemId);
+    };
+}
+
+ContextMenu* PageState::FindMenuById(const std::string& id) const {
+    auto it = menuById_.find(id);
+    return it == menuById_.end() ? nullptr : it->second;
+}
+
+void PageState::InvalidateMenuHandles() {
+    auto& ctx = ui::GetContext();
+    for (const auto& kv : menuHandleCache_) {
+        ctx.RemoveMenu(kv.second);
+    }
+    menuHandleCache_.clear();
+}
+
+uint64_t PageState::GetOrRegisterMenuHandle(const std::string& name) {
+    auto it = menuHandleCache_.find(name);
+    if (it != menuHandleCache_.end()) return it->second;
+    auto* menu = FindMenuById(name);
+    if (!menu) return 0;
+    auto sp = menu->shared_from_this();
+    uint64_t h = ui::GetContext().RegisterMenu(sp);
+    menuHandleCache_[name] = h;
+    return h;
+}
+
+// ---- Global feature flag (historical; retained for env-var bisection) ----
+
+namespace {
+enum class FlagState { Unread, Auto, Off, On };
+FlagState g_quickJsFlag = FlagState::Unread;
+
+void EnsureFlagInit() {
+    if (g_quickJsFlag != FlagState::Unread) return;
+    const char* env = std::getenv("UI_PAGE_QUICKJS");
+    if (env && env[0]) {
+        g_quickJsFlag = (env[0] == '0' && env[1] == 0)
+                        ? FlagState::Off : FlagState::On;
+    } else {
+        g_quickJsFlag = FlagState::Auto;
+    }
+}
+}  // namespace
+
+void PageState::SetGlobalUseQuickJS(bool v) {
+    g_quickJsFlag = v ? FlagState::On : FlagState::Off;
+}
+bool PageState::GetGlobalUseQuickJS() {
+    EnsureFlagInit();
+    return g_quickJsFlag == FlagState::On;
+}
+
+void PageState::Attach(CompiledPage page) {
+    EnsureFlagInit();
+    // The flag exists for env-var diff-bisecting; setting UI_PAGE_QUICKJS=0
+    // would historically force the legacy AST path. That path no longer
+    // exists, so we just route everything through QuickJS.
+    AttachQuickJS(std::move(page));
+}
+
+// ---- QuickJS path ---------------------------------------------------------
+
+struct PageState::JsCondRuntime {
+    Widget*               parent       = nullptr;
+    size_t                insertIdx    = 0;
+    const ui::uix::Node*  templateNode = nullptr;
+    const ui::css::Stylesheet* sheet   = nullptr;
+    JSValue               fn           = JS_UNDEFINED;
+    WidgetPtr             mounted;
+    std::vector<uint64_t> innerEffects;
+    std::vector<JSValue>  innerFns;
+    // v-for runtimes inside this conditional. spec stored alongside so
+    // JsLoopRuntime::spec (raw ptr) stays valid for the runtime's lifetime.
+    std::vector<CompiledLoop>                  innerLoopSpecs;
+    std::vector<std::unique_ptr<JsLoopRuntime>> innerLoops;
+};
+
+// Per-iteration binding bookkeeping. We need (fn, target, property) together
+// so keyed reuse can dispose-and-rebind the effect with the same closure +
+// dispatch info — without recompiling the closure.
+struct IterBinding {
+    JSValue     fn       = JS_UNDEFINED;
+    Widget*     target   = nullptr;
+    std::string property;
+    uint64_t    effectId = 0;
+};
+
+// v-if nested inside a v-for iteration. Distinct from JsCondRuntime: the
+// condition expression and any bindings inside the mounted subtree must be
+// evaluated against the iteration's loop scope (item / idx), so closures
+// here go through CompileLoopBindingClosure rather than the global one.
+// Forward decl for self-nesting (v-if inside v-if inside v-for).
+struct CondInIter;
+
+struct CondInIter {
+    Widget*               parent       = nullptr;
+    size_t                insertIdx    = 0;
+    const ui::uix::Node*  templateNode = nullptr;
+    JSValue               fn           = JS_UNDEFINED;  // loop closure: fn(item[, idx]) → bool
+    uint64_t              effectId     = 0;
+    WidgetPtr             mounted;
+    std::vector<JSValue>  innerFns;
+    std::vector<uint64_t> innerEffects;
+    // v-if nested inside this v-if (still in the outer v-for's loop scope).
+    // mount() builds them; unmount() tears them down.
+    std::vector<std::unique_ptr<CondInIter>> innerConditionals;
+    // v-for nested inside this v-if (so v-for > v-if > v-for). spec storage
+    // owns the CompiledLoop so JsLoopRuntime::spec stays valid.
+    std::vector<CompiledLoop>                            innerLoopSpecs;
+    std::vector<std::unique_ptr<PageState::JsLoopRuntime>> innerLoops;
+};
+
+struct PageState::JsLoopIteration {
+    std::string key;                  // identity for keyed diff
+    JSValue   itemValue = JS_UNDEFINED;
+    JSValue   idxValue  = JS_UNDEFINED;
+    WidgetPtr mountedRoot;
+    CompiledPage subPage;
+    std::vector<IterBinding> bindings;
+    std::vector<JSValue>     eventFns;
+    // v-if nodes that lived directly under the v-for template node. Each
+    // mounts/unmounts its own subtree based on a per-item evaluation.
+    std::vector<std::unique_ptr<CondInIter>> conditionals;
+};
+
+struct PageState::JsLoopRuntime {
+    const CompiledLoop* spec = nullptr;
+    JSValue   listFn   = JS_UNDEFINED;
+    JSValue   keyFn    = JS_UNDEFINED;     // optional — fallback is positional "#i"
+    uint64_t  watcherId = 0;
+    std::vector<std::unique_ptr<JsLoopIteration>> iterations;
+
+    // ---- Nested-loop scope (v-for inside v-if inside v-for) ----------------
+    // When this loop is built inside a CondInIter that itself lives inside a
+    // v-for iteration, listFn / keyFn / per-iter binding closures are
+    // compiled with the OUTER iteration's loopVar / indexVar prepended as
+    // params. At call time we build the args array as
+    //   [outerItem (, outerIdx), thisItem (, thisIdx), $event?]
+    // matching the param order used at compile time.
+    JsLoopIteration*         outerIter = nullptr;
+    std::vector<std::string> outerParamNames;   // ordered, matches compile params
+    std::set<std::string>    outerLocals;       // for the rewriter
+    bool                     outerHasIdx = false;
+};
+
+void PageState::DetachQuickJS() {
+    if (!jsRt_) return;
+    // Fire unmount hooks before tearing anything down — registered onUnmount
+    // callbacks (ui_page_on_widget_unmount) need a chance to release
+    // external resources tied to the live widget instances. Without this
+    // window-close / page-swap leaks any user-attached cleanup.
+    if (page_.root) DispatchUnmountHooks(page_.root.get());
+
+    for (uint64_t id : jsEffectIds_) jsRt_->DisposeEffect(id);
+    jsEffectIds_.clear();
+    JSContext* ctx = jsRt_->ctx();
+    for (auto& cr : jsCondRuntimes_) {
+        for (uint64_t id : cr->innerEffects) jsRt_->DisposeEffect(id);
+        for (auto& f  : cr->innerFns)        JS_FreeValue(ctx, f);
+        for (auto& lr : cr->innerLoops)      if (lr) TearDownJsLoopRuntime(*lr);
+        cr->innerLoops.clear();
+        cr->innerLoopSpecs.clear();
+        if (!JS_IsUndefined(cr->fn))         JS_FreeValue(ctx, cr->fn);
+        cr->innerEffects.clear();
+        cr->innerFns.clear();
+        cr->mounted.reset();
+    }
+    jsCondRuntimes_.clear();
+    for (auto& lr : jsLoopRuntimes_) if (lr) TearDownJsLoopRuntime(*lr);
+    jsLoopRuntimes_.clear();
+    for (auto& fn : jsBindingFns_) JS_FreeValue(ctx, fn);
+    jsBindingFns_.clear();
+    for (auto& fn : jsEventFns_) JS_FreeValue(ctx, fn);
+    jsEventFns_.clear();
+    if (!JS_IsUndefined(jsState_))   JS_FreeValue(ctx, jsState_);
+    if (!JS_IsUndefined(jsOptions_)) JS_FreeValue(ctx, jsOptions_);
+    jsState_   = JS_UNDEFINED;
+    jsOptions_ = JS_UNDEFINED;
+    jsRt_.reset();
+}
+
+void PageState::AttachQuickJS(CompiledPage page) {
+    DetachQuickJS();
+    InvalidateMenuHandles();
+    page_ = std::move(page);
+
+    jsRt_ = std::make_unique<ui::uix::ScriptRuntime>();
+    jsRt_->SetUserData(this);
+    JSContext* ctx = jsRt_->ctx();
+
+    bool hasScript = false;
+    for (char c : page_.scriptSource) {
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') { hasScript = true; break; }
+    }
+
+    JSValue dataObj;
+    if (hasScript) {
+        auto evalRes = jsRt_->EvalModule(page_.scriptSource, "<script>");
+        if (!evalRes.ok) {
+            errors_.push_back("<script> JS error: " + jsRt_->lastError());
+            return;
+        }
+        jsOptions_ = evalRes.defaultExport;
+
+        JSValue dataFn = JS_GetPropertyStr(ctx, jsOptions_, "data");
+        if (JS_IsFunction(ctx, dataFn)) {
+            dataObj = JS_Call(ctx, dataFn, JS_UNDEFINED, 0, nullptr);
+        } else if (JS_IsObject(dataFn)) {
+            dataObj = JS_DupValue(ctx, dataFn);
+        } else {
+            dataObj = JS_NewObject(ctx);
+        }
+        JS_FreeValue(ctx, dataFn);
+
+        if (JS_IsException(dataObj)) {
+            errors_.push_back("data() threw");
+            JSValue exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            JS_FreeValue(ctx, dataObj);
+            return;
+        }
+    } else {
+        jsOptions_ = JS_UNDEFINED;
+        dataObj    = JS_NewObject(ctx);
+    }
+
+    // 3a. Merge methods{} onto data BEFORE Proxy wrap.
+    if (!JS_IsUndefined(jsOptions_)) {
+        JSValue methods = JS_GetPropertyStr(ctx, jsOptions_, "methods");
+        if (JS_IsObject(methods)) {
+            JSPropertyEnum* tab = nullptr;
+            uint32_t        len = 0;
+            if (JS_GetOwnPropertyNames(ctx, &tab, &len, methods,
+                                        JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0) {
+                for (uint32_t i = 0; i < len; ++i) {
+                    JSValue m = JS_GetProperty(ctx, methods, tab[i].atom);
+                    JS_SetProperty(ctx, dataObj, tab[i].atom, m);
+                    JS_FreeAtom(ctx, tab[i].atom);
+                }
+                js_free(ctx, tab);
+            }
+        }
+        JS_FreeValue(ctx, methods);
+    }
+
+    // 3a.bis. i18n: $locale + $t on dataObj.
+    JS_SetPropertyStr(ctx, dataObj, "$locale",
+                       JS_NewStringLen(ctx, currentLocale_.data(),
+                                       currentLocale_.size()));
+    JS_SetPropertyStr(ctx, dataObj, "$t",
+                       JS_NewCFunction(ctx, &JsTranslateTrampoline, "$t", 1));
+
+    // 3b. MakeReactive — capture dataObj's pointer first; the Proxy keeps a
+    // ref so the underlying object stays alive, and the get-trap uses the
+    // same pointer as the dep-map key.
+    void* dataPtr = JS_VALUE_GET_PTR(dataObj);
+    jsState_ = jsRt_->MakeReactive(dataObj);
+    JS_FreeValue(ctx, dataObj);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JS_SetPropertyStr(ctx, global, "state", JS_DupValue(ctx, jsState_));
+    JS_FreeValue(ctx, global);
+
+    // 3c. computed{} — lazy memoized derived values.
+    JSValue computed = JS_IsUndefined(jsOptions_)
+                        ? JS_UNDEFINED
+                        : JS_GetPropertyStr(ctx, jsOptions_, "computed");
+    if (JS_IsObject(computed)) {
+        JSPropertyEnum* tab = nullptr;
+        uint32_t        len = 0;
+        if (JS_GetOwnPropertyNames(ctx, &tab, &len, computed,
+                                    JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) >= 0) {
+            for (uint32_t i = 0; i < len; ++i) {
+                JSValue fn = JS_GetProperty(ctx, computed, tab[i].atom);
+                const char* name = JS_AtomToCString(ctx, tab[i].atom);
+                if (name && JS_IsFunction(ctx, fn)) {
+                    jsRt_->DefineComputed(dataPtr, name, fn, jsState_);
+                }
+                if (name) JS_FreeCString(ctx, name);
+                JS_FreeValue(ctx, fn);
+                JS_FreeAtom(ctx, tab[i].atom);
+            }
+            js_free(ctx, tab);
+        }
+    }
+    JS_FreeValue(ctx, computed);
+
+    // 4. Wire each CompiledBinding as a WatchEffect.
+    for (auto& b : page_.bindings) {
+        std::string rewritten = ui::uix::RewriteTemplateExpr(b.sourceJs);
+        JSValue fn = jsRt_->CompileBindingClosure(rewritten);
+        if (JS_IsException(fn)) {
+            errors_.push_back("binding compile error: " + jsRt_->lastError() +
+                              "\n  source: " + b.sourceJs);
+            continue;
+        }
+        jsBindingFns_.push_back(fn);
+
+        Widget*     target = b.target;
+        std::string prop   = b.property;
+
+        uint64_t effectId = jsRt_->WatchEffect([this, ctx, fn, target, prop]() {
+            JSValue r = JS_Call(ctx, fn, jsState_, 0, nullptr);
+            if (JS_IsException(r)) {
+                JSValue exc = JS_GetException(ctx);
+                JS_FreeValue(ctx, exc);
+                JS_FreeValue(ctx, r);
+                return;
+            }
+            ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, r);
+            ApplyBindingToWidget(target, prop, ev);
+            JS_FreeValue(ctx, r);
+        });
+        jsEffectIds_.push_back(effectId);
+    }
+
+    // 5. v-model write-back.
+    for (auto& mw : page_.modelWrites) {
+        WireQuickJSModelWrite(mw.target, mw.propertyName);
+    }
+
+    // 6. v-if conditionals.
+    WireQuickJSConditionals();
+
+    // 7. @event handlers.
+    for (auto& ev : page_.events) {
+        WireQuickJSEvent(ev.target, ev.event, ev.sourceJs);
+    }
+
+    // 8. v-for loops.
+    WireQuickJSLoops();
+
+    // 9. Menus.
+    WireMenus();
+
+    for (auto& e : page_.errors) errors_.push_back(e);
+
+    // 10. Initial mount hooks — fire once for every widget already in the
+    // root tree (anything outside v-if/v-for is mounted at this point).
+    // v-if and v-for paths fire their own hooks at mount time.
+    if (page_.root) DispatchMountHooks(page_.root.get());
+}
+
+void PageState::WireQuickJSConditionals() {
+    // Snapshot the size up-front: nested v-if mounts append their
+    // sub.conditionals to page_.conditionals and wire those entries
+    // themselves. We must NOT double-wire those late-added entries here.
+    size_t initial = page_.conditionals.size();
+    for (size_t i = 0; i < initial; ++i) {
+        WireConditional(page_.conditionals[i]);
+    }
+}
+
+void PageState::WireConditional(const CompiledConditional& c) {
+    JSContext* ctx = jsRt_->ctx();
+    {
+        auto rt = std::make_unique<JsCondRuntime>();
+        rt->parent       = c.parentWidget;
+        rt->insertIdx    = c.insertIndex;
+        rt->templateNode = c.templateNode;
+        rt->sheet        = page_.ownedStylesheet.get();
+
+        std::string rewritten = ui::uix::RewriteTemplateExpr(c.condSourceJs);
+        rt->fn = jsRt_->CompileBindingClosure(rewritten);
+        if (JS_IsException(rt->fn)) {
+            errors_.push_back("v-if compile error: " + jsRt_->lastError() +
+                              "\n  source: " + c.condSourceJs);
+            return;
+        }
+
+        JsCondRuntime* rtRaw = rt.get();
+        jsCondRuntimes_.push_back(std::move(rt));
+
+        uint64_t effectId = jsRt_->WatchEffect([this, ctx, rtRaw]() {
+            JSValue r = JS_Call(ctx, rtRaw->fn, jsState_, 0, nullptr);
+            if (JS_IsException(r)) {
+                JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                JS_FreeValue(ctx, r);
+                return;
+            }
+            bool truthy = ui::uix::JSValueToBool(ctx, r);
+            JS_FreeValue(ctx, r);
+
+            bool isMounted = rtRaw->mounted != nullptr;
+            if (truthy && !isMounted) {
+                ui::RequestLayout();
+                auto sub = CompileConditionalTemplate(*rtRaw->templateNode,
+                                                     *rtRaw->sheet,
+                                                     page_.cssVars);
+                if (!sub.root) return;
+                rtRaw->mounted = sub.root;
+                if (rtRaw->parent) {
+                    rtRaw->parent->InsertChild(rtRaw->insertIdx, sub.root);
+                }
+                for (auto& b : sub.bindings) {
+                    std::string rew = ui::uix::RewriteTemplateExpr(b.sourceJs);
+                    JSValue fn = jsRt_->CompileBindingClosure(rew);
+                    if (JS_IsException(fn)) continue;
+                    rtRaw->innerFns.push_back(fn);
+                    Widget*     tg = b.target;
+                    std::string pp = b.property;
+                    uint64_t id = jsRt_->WatchEffect([this, ctx, fn, tg, pp]() {
+                        JSValue rr = JS_Call(ctx, fn, jsState_, 0, nullptr);
+                        if (JS_IsException(rr)) {
+                            JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex);
+                            JS_FreeValue(ctx, rr);
+                            return;
+                        }
+                        ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, rr);
+                        ApplyBindingToWidget(tg, pp, ev);
+                        JS_FreeValue(ctx, rr);
+                    });
+                    rtRaw->innerEffects.push_back(id);
+                }
+                for (auto& mw : sub.modelWrites) {
+                    WireQuickJSModelWrite(mw.target, mw.propertyName);
+                }
+                for (auto& sev : sub.events) {
+                    WireQuickJSEvent(sev.target, sev.event, sev.sourceJs);
+                }
+                // v-for inside this v-if: move loop specs into long-lived
+                // storage on the JsCondRuntime so spec ptrs stay valid for
+                // the runtime lifetime; build a JsLoopRuntime per spec.
+                rtRaw->innerLoopSpecs = std::move(sub.loops);
+                rtRaw->innerLoops.reserve(rtRaw->innerLoopSpecs.size());
+                for (auto& spec : rtRaw->innerLoopSpecs) {
+                    rtRaw->innerLoops.push_back(BuildJsLoopRuntime(&spec));
+                }
+                // <menu> declared inside this v-if subtree — wire trigger +
+                // dispatch so right-click / click on a freshly-mounted page
+                // actually pops the menu. Without this the compiled menus
+                // are produced but never registered.
+                if (!sub.menus.empty()) {
+                    WireSubtreeMenus(sub.menus, menus_);
+                }
+                // v-if directly inside this v-if — store the spec in
+                // page_.conditionals (so the templateNode/parentWidget pointers
+                // stay valid for the rest of the page lifetime) and wire each
+                // one. WireQuickJSConditionals' main loop snapshots size() at
+                // entry, so these late-added entries won't be re-processed.
+                for (auto& sc : sub.conditionals) {
+                    page_.conditionals.push_back(std::move(sc));
+                    WireConditional(page_.conditionals.back());
+                }
+                // The compile-time cascade for the freshly-mounted subtree
+                // sees only the static parent chain captured when the SFC
+                // was parsed — runtime :class bindings on ancestors (e.g.
+                // shell.dark) are invisible at that point. Walk the new
+                // subtree and trigger recomputeStyle so each widget rebuilds
+                // its MatchNode chain from the LIVE tree, picking up
+                // ancestor dynamicClasses.
+                std::function<void(Widget*)> reapply = [&](Widget* x) {
+                    if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+                    for (auto& c : x->Children()) reapply(c.get());
+                };
+                if (rtRaw->mounted) reapply(rtRaw->mounted.get());
+                // Rebind C-level callbacks (ui_widget_on_click etc.) registered
+                // before this v-if was first re-mounted. Keyed by widget id.
+                if (rtRaw->mounted) ui::GetContext().RebindWidgetCallbacks(rtRaw->mounted.get());
+                // Fire mount lifecycle hooks (Vue parity — let downstream
+                // re-attach state on the freshly-built widget instance).
+                if (rtRaw->mounted) DispatchMountHooks(rtRaw->mounted.get());
+            } else if (!truthy && isMounted) {
+                ui::RequestLayout();
+                // Fire unmount hooks before tearing the subtree down so
+                // user code can read final widget state.
+                if (rtRaw->mounted) DispatchUnmountHooks(rtRaw->mounted.get());
+                for (auto& lr : rtRaw->innerLoops) if (lr) TearDownJsLoopRuntime(*lr);
+                rtRaw->innerLoops.clear();
+                rtRaw->innerLoopSpecs.clear();
+                for (uint64_t id : rtRaw->innerEffects) jsRt_->DisposeEffect(id);
+                rtRaw->innerEffects.clear();
+                for (auto& f : rtRaw->innerFns) JS_FreeValue(ctx, f);
+                rtRaw->innerFns.clear();
+                if (rtRaw->parent && rtRaw->mounted) {
+                    rtRaw->parent->RemoveChild(rtRaw->mounted.get());
+                }
+                rtRaw->mounted.reset();
+            }
+        });
+        jsEffectIds_.push_back(effectId);
+    }
+}
+
+// Build a JsLoopRuntime for a single CompiledLoop. Used both for the
+// page's top-level loops and for v-for loops nested inside v-if subtrees.
+// `spec` must outlive the returned runtime — the runtime stores it as a
+// raw pointer.
+std::unique_ptr<PageState::JsLoopRuntime>
+PageState::BuildJsLoopRuntime(const CompiledLoop* spec) {
+    return BuildJsLoopRuntimeInScope(spec, {}, {}, nullptr, false);
+}
+
+std::unique_ptr<PageState::JsLoopRuntime>
+PageState::BuildJsLoopRuntimeInScope(const CompiledLoop* spec,
+                                      const std::set<std::string>& outerLocals,
+                                      const std::vector<std::string>& outerParamNames,
+                                      JsLoopIteration* outerIter,
+                                      bool outerHasIdx) {
+    auto rt = std::make_unique<JsLoopRuntime>();
+    rt->spec            = spec;
+    rt->outerIter       = outerIter;
+    rt->outerParamNames = outerParamNames;
+    rt->outerLocals     = outerLocals;
+    rt->outerHasIdx     = outerHasIdx;
+
+    // Compile listFn with outer scope params (so `grp.items` resolves to the
+    // current outer iteration's `grp`). When outerParamNames is empty this
+    // produces the same `(function(){ return EXPR; })` shape as before.
+    std::string listRew = ui::uix::RewriteTemplateExpr(spec->listSourceJs, outerLocals);
+    if (outerParamNames.empty()) {
+        rt->listFn = jsRt_->CompileBindingClosure(listRew);
+    } else {
+        rt->listFn = jsRt_->CompileLoopBindingClosure(listRew, outerParamNames);
+    }
+    if (JS_IsException(rt->listFn)) {
+        errors_.push_back("v-for list compile error: " + jsRt_->lastError() +
+                          "\n  source: " + spec->listSourceJs);
+        rt->listFn = JS_UNDEFINED;
+        return rt;
+    }
+
+    if (!spec->keySourceJs.empty()) {
+        std::set<std::string> locals = outerLocals;
+        if (!spec->loopVar.empty())  locals.insert(spec->loopVar);
+        if (!spec->indexVar.empty()) locals.insert(spec->indexVar);
+        std::vector<std::string> keyParams = outerParamNames;
+        if (!spec->loopVar.empty())  keyParams.push_back(spec->loopVar);
+        if (!spec->indexVar.empty()) keyParams.push_back(spec->indexVar);
+        std::string keyRew = ui::uix::RewriteTemplateExpr(spec->keySourceJs, locals);
+        rt->keyFn = jsRt_->CompileLoopBindingClosure(keyRew, keyParams);
+        if (JS_IsException(rt->keyFn)) {
+            errors_.push_back("v-for :key compile error: " + jsRt_->lastError() +
+                              "\n  source: " + spec->keySourceJs);
+            rt->keyFn = JS_UNDEFINED;
+        }
+    }
+
+    JsLoopRuntime* rtRaw = rt.get();
+    rt->watcherId = jsRt_->WatchEffect([this, rtRaw]() {
+        RebuildJsLoop(*rtRaw);
+    });
+
+    return rt;
+}
+
+void PageState::WireQuickJSLoops() {
+    for (auto& spec : page_.loops) {
+        jsLoopRuntimes_.push_back(BuildJsLoopRuntime(&spec));
+    }
+}
+
+// Tear down a single loop runtime: dispose iterations + watcher + free
+// closures. Used at v-if unmount and at DetachQuickJS time.
+void PageState::TearDownJsLoopRuntime(JsLoopRuntime& rt) {
+    if (!jsRt_) return;
+    JSContext* ctx = jsRt_->ctx();
+    TearDownJsIterations(rt);
+    if (rt.watcherId) jsRt_->DisposeEffect(rt.watcherId);
+    if (!JS_IsUndefined(rt.listFn)) JS_FreeValue(ctx, rt.listFn);
+    if (!JS_IsUndefined(rt.keyFn))  JS_FreeValue(ctx, rt.keyFn);
+}
+
+// Destroy a single iteration: drop its effects, free its closures, free
+// stored item/idx JSValues, unmount its widget. Used for both full
+// teardown and the keyed-diff "remove unused iter" path.
+void PageState::DestroyJsIteration(JsLoopRuntime& rt, JsLoopIteration& iter) {
+    JSContext* ctx = jsRt_->ctx();
+    // Fire unmount hooks before any teardown so callbacks can still read
+    // widget state.
+    if (iter.mountedRoot) DispatchUnmountHooks(iter.mountedRoot.get());
+    // Tear down nested v-if runtimes first — their inner effects reference
+    // the iteration's itemValue/idxValue, which we're about to JS_FreeValue.
+    // Recurse through innerConditionals (v-if inside v-if inside v-for).
+    std::function<void(CondInIter&)> tearDownCond = [&](CondInIter& cr) {
+        // v-for inside v-if — kill iterations + watcher first (they reference
+        // the outer iteration's itemValue, which DestroyJsIteration is about
+        // to free).
+        for (auto& lr : cr.innerLoops) {
+            if (lr) TearDownJsLoopRuntime(*lr);
+        }
+        cr.innerLoops.clear();
+        cr.innerLoopSpecs.clear();
+        for (auto& innerCr : cr.innerConditionals) {
+            if (innerCr) tearDownCond(*innerCr);
+        }
+        cr.innerConditionals.clear();
+        if (cr.effectId) jsRt_->DisposeEffect(cr.effectId);
+        for (uint64_t id : cr.innerEffects) jsRt_->DisposeEffect(id);
+        for (auto& f : cr.innerFns) JS_FreeValue(ctx, f);
+        cr.innerEffects.clear();
+        cr.innerFns.clear();
+        if (!JS_IsUndefined(cr.fn)) JS_FreeValue(ctx, cr.fn);
+        cr.fn = JS_UNDEFINED;
+        cr.mounted.reset();
+    };
+    for (auto& cr : iter.conditionals) {
+        if (cr) tearDownCond(*cr);
+    }
+    iter.conditionals.clear();
+
+    for (auto& b : iter.bindings) {
+        if (b.effectId) jsRt_->DisposeEffect(b.effectId);
+        if (!JS_IsUndefined(b.fn)) JS_FreeValue(ctx, b.fn);
+    }
+    iter.bindings.clear();
+    for (auto& fn : iter.eventFns) JS_FreeValue(ctx, fn);
+    iter.eventFns.clear();
+    if (!JS_IsUndefined(iter.itemValue)) JS_FreeValue(ctx, iter.itemValue);
+    if (!JS_IsUndefined(iter.idxValue))  JS_FreeValue(ctx, iter.idxValue);
+    iter.itemValue = JS_UNDEFINED;
+    iter.idxValue  = JS_UNDEFINED;
+    if (iter.mountedRoot && rt.spec && rt.spec->parentWidget) {
+        rt.spec->parentWidget->RemoveChild(iter.mountedRoot.get());
+    }
+    iter.mountedRoot.reset();
+}
+
+void PageState::TearDownJsIterations(JsLoopRuntime& rt) {
+    if (!jsRt_) return;
+    for (auto& iter : rt.iterations) {
+        if (iter) DestroyJsIteration(rt, *iter);
+    }
+    rt.iterations.clear();
+}
+
+// Compute the key string for an item. Falls back to "#<idx>" when no
+// :key was declared (effectively positional reuse, which still preserves
+// widget identity for stable-length lists).
+std::string PageState::ComputeIterationKey(JsLoopRuntime& rt, JSValue item,
+                                            JSValue idx, uint32_t pos) {
+    if (JS_IsUndefined(rt.keyFn)) {
+        return "#" + std::to_string(pos);
+    }
+    JSContext* ctx = jsRt_->ctx();
+    bool hasIdx = !rt.spec->indexVar.empty();
+    JSValue args[4];
+    int argc = 0;
+    if (rt.outerIter) {
+        args[argc++] = rt.outerIter->itemValue;
+        if (rt.outerHasIdx) args[argc++] = rt.outerIter->idxValue;
+    }
+    args[argc++] = item;
+    if (hasIdx) args[argc++] = idx;
+    JSValue r = JS_Call(ctx, rt.keyFn, jsState_, argc, args);
+    if (JS_IsException(r)) {
+        JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+        JS_FreeValue(ctx, r);
+        return "#" + std::to_string(pos);
+    }
+    const char* s = JS_ToCString(ctx, r);
+    std::string out = s ? s : ("#" + std::to_string(pos));
+    if (s) JS_FreeCString(ctx, s);
+    JS_FreeValue(ctx, r);
+    return out;
+}
+
+// Re-bind an existing iteration's binding effects to fresh deps. Called
+// when keyed diff reuses the iteration: the (item, idx) JSValues changed,
+// so any binding that read `this.something` needs its dep set rebuilt.
+// We dispose the old effects (clears them from depMap_) and re-WatchEffect
+// using the SAME stored fn JSValues + (target, property) — no recompile,
+// no widget rebuild.
+void PageState::RewireIterationBindings(JsLoopRuntime& rt, JsLoopIteration& iter) {
+    JSContext* ctx = jsRt_->ctx();
+    bool hasIdx   = !rt.spec->indexVar.empty();
+    JsLoopIteration* iterRaw = &iter;
+    JsLoopRuntime*   rtPtr   = &rt;
+
+    for (auto& b : iter.bindings) {
+        if (b.effectId) jsRt_->DisposeEffect(b.effectId);
+        b.effectId = 0;
+
+        Widget*     target = b.target;
+        std::string prop   = b.property;
+        JSValue     fn     = b.fn;
+
+        b.effectId = jsRt_->WatchEffect(
+            [this, ctx, fn, target, prop, iterRaw, hasIdx, rtPtr]() {
+                JSValue args[4];
+                int argc = 0;
+                if (rtPtr->outerIter) {
+                    args[argc++] = rtPtr->outerIter->itemValue;
+                    if (rtPtr->outerHasIdx) args[argc++] = rtPtr->outerIter->idxValue;
+                }
+                args[argc++] = iterRaw->itemValue;
+                if (hasIdx) args[argc++] = iterRaw->idxValue;
+                JSValue r = JS_Call(ctx, fn, jsState_, argc, args);
+                if (JS_IsException(r)) {
+                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                    JS_FreeValue(ctx, r); return;
+                }
+                ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, r);
+                ApplyBindingToWidget(target, prop, ev);
+                JS_FreeValue(ctx, r);
+            });
+    }
+}
+
+void PageState::RebuildJsLoop(JsLoopRuntime& rt) {
+    if (!rt.spec || !rt.spec->parentWidget || !rt.spec->templateNode) return;
+    if (!jsRt_ || JS_IsUndefined(rt.listFn)) return;
+    JSContext* ctx = jsRt_->ctx();
+
+    // Build outer args (for nested v-for inside v-if inside v-for).
+    JSValue outerArgs[2];
+    int outerArgc = 0;
+    if (rt.outerIter) {
+        outerArgs[outerArgc++] = rt.outerIter->itemValue;
+        if (rt.outerHasIdx) outerArgs[outerArgc++] = rt.outerIter->idxValue;
+    }
+    JSValue list = JS_Call(ctx, rt.listFn, jsState_, outerArgc, outerArgs);
+    if (JS_IsException(list)) {
+        JSValue exc = JS_GetException(ctx);
+        const char* msg = JS_ToCString(ctx, exc);
+        if (msg) {
+            errors_.push_back(std::string("v-for list eval threw: ") + msg);
+            JS_FreeCString(ctx, msg);
+        }
+        JS_FreeValue(ctx, exc);
+        JS_FreeValue(ctx, list);
+        return;
+    }
+
+    if (!JS_IsArray(list)) {
+        TearDownJsIterations(rt);
+        JS_FreeValue(ctx, list);
+        return;
+    }
+
+    JSValue lenV = JS_GetPropertyStr(ctx, list, "length");
+    uint32_t len = 0;
+    JS_ToUint32(ctx, &len, lenV);
+    JS_FreeValue(ctx, lenV);
+
+    // Index existing iterations by key — duplicates collapse to last seen
+    // (matches Vue's "last duplicate wins" though duplicates are a user bug).
+    std::unordered_map<std::string, std::unique_ptr<JsLoopIteration>> oldByKey;
+    for (auto& it : rt.iterations) {
+        if (!it) continue;
+        oldByKey.emplace(it->key, std::move(it));
+    }
+    rt.iterations.clear();
+
+    if (len > 0) ui::RequestLayout();
+
+    // Walk new list. For each item: compute its key, reuse if matched, else
+    // build fresh.
+    std::vector<std::unique_ptr<JsLoopIteration>> newIters;
+    newIters.reserve(len);
+    for (uint32_t i = 0; i < len; ++i) {
+        JSValue itemVal = JS_GetPropertyUint32(ctx, list, i);
+        JSValue idxVal  = JS_NewInt32(ctx, static_cast<int>(i));
+        std::string key = ComputeIterationKey(rt, itemVal, idxVal, i);
+
+        auto found = oldByKey.find(key);
+        if (found != oldByKey.end() && found->second) {
+            // Reuse: keep widget tree + onClick wiring, refresh stored
+            // (item, idx) JSValues + re-collect dep set for bindings.
+            auto iter = std::move(found->second);
+            oldByKey.erase(found);
+            JS_FreeValue(ctx, iter->itemValue);
+            JS_FreeValue(ctx, iter->idxValue);
+            iter->itemValue = itemVal;     // takes ownership
+            iter->idxValue  = idxVal;
+            RewireIterationBindings(rt, *iter);
+            newIters.push_back(std::move(iter));
+        } else {
+            // New: full build (compiles per-iteration template + closures).
+            auto iter = BuildJsIteration(rt, itemVal, idxVal, i);
+            iter->key = std::move(key);
+            newIters.push_back(std::move(iter));
+        }
+    }
+
+    // Tear down whichever old iterations weren't reused.
+    for (auto& kv : oldByKey) {
+        if (kv.second) DestroyJsIteration(rt, *kv.second);
+    }
+    oldByKey.clear();
+
+    // Reorder the parent's children so iterations appear in the new list
+    // order. Pull all reused widgets out first, then reinsert at the
+    // correct positions (insertIndex + i). New iters were already
+    // InsertChild'd at construction, but at the wrong slot — same lift +
+    // reinsert dance gets them right too.
+    if (rt.spec->parentWidget) {
+        for (auto& iter : newIters) {
+            if (iter && iter->mountedRoot) {
+                rt.spec->parentWidget->RemoveChild(iter->mountedRoot.get());
+            }
+        }
+        for (uint32_t i = 0; i < newIters.size(); ++i) {
+            if (newIters[i] && newIters[i]->mountedRoot) {
+                size_t pos = rt.spec->insertIndex + i;
+                if (pos > rt.spec->parentWidget->Children().size())
+                    pos = rt.spec->parentWidget->Children().size();
+                rt.spec->parentWidget->InsertChild(pos, newIters[i]->mountedRoot);
+            }
+        }
+    }
+
+    rt.iterations = std::move(newIters);
+    JS_FreeValue(ctx, list);
+}
+
+void PageState::WireLoopScopeEvent(Widget* target, const std::string& evName,
+                                    JSValue fn, JsLoopIteration* iter, bool hasIdx) {
+    WireLoopScopeEventEx(target, evName, fn, iter, hasIdx, nullptr);
+}
+
+void PageState::WireLoopScopeEventEx(Widget* target, const std::string& evName,
+                                      JSValue fn, JsLoopIteration* iter, bool hasIdx,
+                                      JsLoopRuntime* rt) {
+    if (!target || !jsRt_) return;
+    JSContext* ctx = jsRt_->ctx();
+
+    // callHandler: prepends [outerItem, outerIdx?,] item, idx? before $event.
+    // outer scope only present when this v-for is nested inside v-if inside v-for.
+    auto callHandler = [this, ctx, fn, iter, hasIdx, evName, rt](JSValue arg) {
+        JSValue args[5];
+        int argc = 0;
+        if (rt && rt->outerIter) {
+            args[argc++] = rt->outerIter->itemValue;
+            if (rt->outerHasIdx) args[argc++] = rt->outerIter->idxValue;
+        }
+        args[argc++] = iter->itemValue;
+        if (hasIdx) args[argc++] = iter->idxValue;
+        args[argc++] = arg;
+        JSValue r = JS_Call(ctx, fn, jsState_, argc, args);
+        if (JS_IsException(r)) {
+            JSValue exc = JS_GetException(ctx);
+            const char* msg = JS_ToCString(ctx, exc);
+            if (msg) {
+                errors_.push_back("v-for @" + evName + " threw: " + msg);
+                JS_FreeCString(ctx, msg);
+            }
+            JS_FreeValue(ctx, exc);
+        }
+        JS_FreeValue(ctx, r);
+        JS_FreeValue(ctx, arg);
+    };
+
+    if (evName == "click") {
+        target->onClick = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "change" || evName == "input") {
+        target->onValueChanged = [callHandler, ctx](bool v) {
+            callHandler(JS_NewBool(ctx, v));
+        };
+        target->onTextChanged = [callHandler, ctx](const std::wstring& v) {
+            std::string utf8 = ToUtf8(v);
+            callHandler(JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+        };
+        target->onFloatChanged = [callHandler, ctx](float v) {
+            callHandler(JS_NewFloat64(ctx, static_cast<double>(v)));
+        };
+    } else if (evName == "dblclick") {
+        target->onMouseDblClickHook = [callHandler, ctx](const ui::MouseEvent& e) {
+            JSValue obj = JS_NewObject(ctx);
+            JS_SetPropertyStr(ctx, obj, "x",      JS_NewFloat64(ctx, e.x));
+            JS_SetPropertyStr(ctx, obj, "y",      JS_NewFloat64(ctx, e.y));
+            JS_SetPropertyStr(ctx, obj, "delta",  JS_NewFloat64(ctx, e.delta));
+            JS_SetPropertyStr(ctx, obj, "button", JS_NewInt32(ctx, e.leftBtn ? 0 : -1));
+            callHandler(obj);
+        };
+    }
+    // Other events (mousedown / mouseup / wheel / focus / blur) — add as needed.
+}
+
+std::unique_ptr<CondInIter> PageState::BuildCondInIter(
+    const CompiledConditional& c,
+    const std::set<std::string>& locals,
+    const std::string& loopVar,
+    const std::string& indexVar,
+    JsLoopIteration* iterRaw,
+    bool hasIdx) {
+
+    if (!jsRt_) return nullptr;
+    JSContext* ctx = jsRt_->ctx();
+
+    auto cr = std::make_unique<CondInIter>();
+    cr->parent       = c.parentWidget;
+    cr->insertIdx    = c.insertIndex;
+    cr->templateNode = c.templateNode;
+
+    std::string rew = ui::uix::RewriteTemplateExpr(c.condSourceJs, locals);
+    cr->fn = jsRt_->CompileLoopBindingClosure(rew, loopVar, indexVar);
+    if (JS_IsException(cr->fn)) {
+        errors_.push_back("v-for > v-if compile error: " + jsRt_->lastError() +
+                          "\n  source: " + c.condSourceJs);
+        return nullptr;
+    }
+
+    CondInIter* crRaw = cr.get();
+
+    cr->effectId = jsRt_->WatchEffect(
+        [this, ctx, crRaw, iterRaw, hasIdx, loopVar, indexVar, locals]() {
+            JSValue args[2];
+            int argc = 1;
+            args[0] = iterRaw->itemValue;
+            if (hasIdx) args[argc++] = iterRaw->idxValue;
+            JSValue r = JS_Call(ctx, crRaw->fn, jsState_, argc, args);
+            if (JS_IsException(r)) {
+                JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                JS_FreeValue(ctx, r);
+                return;
+            }
+            bool truthy = ui::uix::JSValueToBool(ctx, r);
+            JS_FreeValue(ctx, r);
+
+            bool isMounted = crRaw->mounted != nullptr;
+            if (truthy && !isMounted) {
+                ui::RequestLayout();
+                auto sub = CompileConditionalTemplate(*crRaw->templateNode,
+                                                      *page_.ownedStylesheet,
+                                                      page_.cssVars);
+                if (!sub.root) return;
+                crRaw->mounted = sub.root;
+                if (crRaw->parent) {
+                    crRaw->parent->InsertChild(crRaw->insertIdx, sub.root);
+                }
+                // Bindings — loop closure
+                for (auto& b : sub.bindings) {
+                    std::string brew = ui::uix::RewriteTemplateExpr(b.sourceJs, locals);
+                    JSValue bfn = jsRt_->CompileLoopBindingClosure(brew, loopVar, indexVar);
+                    if (JS_IsException(bfn)) continue;
+                    crRaw->innerFns.push_back(bfn);
+                    Widget* tg = b.target;
+                    std::string pp = b.property;
+                    uint64_t eid = jsRt_->WatchEffect(
+                        [this, ctx, bfn, tg, pp, iterRaw, hasIdx]() {
+                            JSValue args2[2];
+                            int argc2 = 1;
+                            args2[0] = iterRaw->itemValue;
+                            if (hasIdx) args2[argc2++] = iterRaw->idxValue;
+                            JSValue rr = JS_Call(ctx, bfn, jsState_, argc2, args2);
+                            if (JS_IsException(rr)) {
+                                JSValue ex = JS_GetException(ctx); JS_FreeValue(ctx, ex);
+                                JS_FreeValue(ctx, rr);
+                                return;
+                            }
+                            ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, rr);
+                            ApplyBindingToWidget(tg, pp, ev);
+                            JS_FreeValue(ctx, rr);
+                        });
+                    crRaw->innerEffects.push_back(eid);
+                }
+                // Events — loop closure
+                for (auto& sev : sub.events) {
+                    if (!sev.target) continue;
+                    std::string erew = ui::uix::RewriteTemplateExpr(sev.sourceJs, locals);
+                    JSValue efn = jsRt_->CompileLoopHandlerClosure(erew, loopVar, indexVar);
+                    if (JS_IsException(efn)) {
+                        errors_.push_back("v-for > v-if @" + sev.event + " compile error: " +
+                                          jsRt_->lastError() + "\n  source: " + sev.sourceJs);
+                        continue;
+                    }
+                    crRaw->innerFns.push_back(efn);
+                    WireLoopScopeEvent(sev.target, sev.event, efn, iterRaw, hasIdx);
+                }
+                // Menus declared inside this v-if subtree.
+                if (!sub.menus.empty()) {
+                    WireSubtreeMenus(sub.menus, menus_);
+                }
+                // Recurse: v-if directly inside this v-if (still inside the
+                // same v-for iteration, same loop scope). Each builds its own
+                // CondInIter and is owned by the outer one so unmount tears
+                // them down together.
+                for (auto& innerC : sub.conditionals) {
+                    auto innerCr = BuildCondInIter(innerC, locals, loopVar, indexVar,
+                                                    iterRaw, hasIdx);
+                    if (innerCr) crRaw->innerConditionals.push_back(std::move(innerCr));
+                }
+                // v-for declared inside this v-if subtree (so the full chain
+                // is v-for > v-if > v-for). Move the loop specs into long-
+                // lived storage on the CondInIter — JsLoopRuntime::spec is a
+                // raw pointer and must stay valid for the runtime's lifetime.
+                // Each inner v-for's listFn / keyFn / per-iter closures are
+                // compiled with the outer iteration's loopVar/indexVar
+                // prepended; at call time those values come from `iterRaw`.
+                std::vector<std::string> outerParams;
+                if (!loopVar.empty())  outerParams.push_back(loopVar);
+                if (!indexVar.empty()) outerParams.push_back(indexVar);
+                crRaw->innerLoopSpecs = std::move(sub.loops);
+                crRaw->innerLoops.reserve(crRaw->innerLoopSpecs.size());
+                for (auto& spec : crRaw->innerLoopSpecs) {
+                    crRaw->innerLoops.push_back(
+                        BuildJsLoopRuntimeInScope(&spec, locals, outerParams,
+                                                   iterRaw, hasIdx));
+                }
+                // Re-cascade + RebindWidgetCallbacks + DispatchMountHooks
+                std::function<void(Widget*)> reapply = [&](Widget* x) {
+                    if (x->recomputeStyle) x->recomputeStyle(x->lastStateBits);
+                    for (auto& cc : x->Children()) reapply(cc.get());
+                };
+                if (crRaw->mounted) reapply(crRaw->mounted.get());
+                if (crRaw->mounted) ui::GetContext().RebindWidgetCallbacks(crRaw->mounted.get());
+                if (crRaw->mounted) DispatchMountHooks(crRaw->mounted.get());
+            } else if (!truthy && isMounted) {
+                ui::RequestLayout();
+                if (crRaw->mounted) DispatchUnmountHooks(crRaw->mounted.get());
+                // Tear down nested v-for first — their iterations reference
+                // iterRaw->itemValue. Then nested v-if (same reason).
+                for (auto& lr : crRaw->innerLoops) {
+                    if (lr) TearDownJsLoopRuntime(*lr);
+                }
+                crRaw->innerLoops.clear();
+                crRaw->innerLoopSpecs.clear();
+                for (auto& innerCr : crRaw->innerConditionals) {
+                    if (innerCr->effectId) jsRt_->DisposeEffect(innerCr->effectId);
+                    for (uint64_t id : innerCr->innerEffects) jsRt_->DisposeEffect(id);
+                    for (auto& f : innerCr->innerFns) JS_FreeValue(ctx, f);
+                    if (!JS_IsUndefined(innerCr->fn)) JS_FreeValue(ctx, innerCr->fn);
+                    innerCr->mounted.reset();
+                }
+                crRaw->innerConditionals.clear();
+                for (uint64_t id : crRaw->innerEffects) jsRt_->DisposeEffect(id);
+                crRaw->innerEffects.clear();
+                for (auto& f : crRaw->innerFns) JS_FreeValue(ctx, f);
+                crRaw->innerFns.clear();
+                if (crRaw->parent && crRaw->mounted) {
+                    crRaw->parent->RemoveChild(crRaw->mounted.get());
+                }
+                crRaw->mounted.reset();
+            }
+        });
+
+    return cr;
+}
+
+std::unique_ptr<PageState::JsLoopIteration> PageState::BuildJsIteration(
+    JsLoopRuntime& rt, JSValue itemValue, JSValue idxValue, uint32_t idx) {
+    auto iter = std::make_unique<JsLoopIteration>();
+    iter->itemValue = itemValue;
+    iter->idxValue  = idxValue;
+
+    JSContext* ctx = jsRt_->ctx();
+
+    iter->subPage = CompileIterationTemplate(*rt.spec->templateNode,
+                                              *page_.ownedStylesheet,
+                                              page_.cssVars);
+    if (!iter->subPage.root) return iter;
+    iter->mountedRoot = iter->subPage.root;
+
+    if (rt.spec->parentWidget) {
+        size_t pos = rt.spec->insertIndex + idx;
+        if (pos > rt.spec->parentWidget->Children().size())
+            pos = rt.spec->parentWidget->Children().size();
+        rt.spec->parentWidget->InsertChild(pos, iter->mountedRoot);
+    }
+
+    // Locals + param names: union of outer scope and this loop's own vars.
+    // Outer scope is non-empty only when we were built via
+    // BuildJsLoopRuntimeInScope (i.e. v-for inside v-if inside v-for).
+    std::set<std::string>    locals = rt.outerLocals;
+    std::vector<std::string> paramNames = rt.outerParamNames;
+    if (!rt.spec->loopVar.empty()) {
+        locals.insert(rt.spec->loopVar);
+        paramNames.push_back(rt.spec->loopVar);
+    }
+    if (!rt.spec->indexVar.empty()) {
+        locals.insert(rt.spec->indexVar);
+        paramNames.push_back(rt.spec->indexVar);
+    }
+
+    bool        hasIdx   = !rt.spec->indexVar.empty();
+    JsLoopIteration* iterRaw = iter.get();
+    JsLoopRuntime*   rtPtr   = &rt;
+
+    for (auto& b : iter->subPage.bindings) {
+        std::string rew = ui::uix::RewriteTemplateExpr(b.sourceJs, locals);
+        JSValue fn = jsRt_->CompileLoopBindingClosure(rew, paramNames);
+        if (JS_IsException(fn)) {
+            errors_.push_back("v-for binding compile error: " + jsRt_->lastError() +
+                              "\n  source: " + b.sourceJs);
+            continue;
+        }
+
+        IterBinding ib;
+        ib.fn       = fn;
+        ib.target   = b.target;
+        ib.property = b.property;
+
+        Widget*     target = ib.target;
+        std::string prop   = ib.property;
+
+        ib.effectId = jsRt_->WatchEffect(
+            [this, ctx, fn, target, prop, iterRaw, hasIdx, rtPtr]() {
+                JSValue args[4];
+                int argc = 0;
+                if (rtPtr->outerIter) {
+                    args[argc++] = rtPtr->outerIter->itemValue;
+                    if (rtPtr->outerHasIdx) args[argc++] = rtPtr->outerIter->idxValue;
+                }
+                args[argc++] = iterRaw->itemValue;
+                if (hasIdx) args[argc++] = iterRaw->idxValue;
+                JSValue r = JS_Call(ctx, fn, jsState_, argc, args);
+                if (JS_IsException(r)) {
+                    JSValue exc = JS_GetException(ctx); JS_FreeValue(ctx, exc);
+                    JS_FreeValue(ctx, r); return;
+                }
+                ui::expr::Value ev = ui::uix::JSValueToExprValue(ctx, r);
+                ApplyBindingToWidget(target, prop, ev);
+                JS_FreeValue(ctx, r);
+            });
+        iter->bindings.push_back(std::move(ib));
+    }
+
+    for (auto& ev : iter->subPage.events) {
+        std::string rew = ui::uix::RewriteTemplateExpr(ev.sourceJs, locals);
+        JSValue fn = jsRt_->CompileLoopHandlerClosure(rew, paramNames);
+        if (JS_IsException(fn)) {
+            errors_.push_back("v-for @" + ev.event + " compile error: " +
+                              jsRt_->lastError() + "\n  source: " + ev.sourceJs);
+            continue;
+        }
+        iter->eventFns.push_back(fn);
+        if (!ev.target) continue;
+        WireLoopScopeEventEx(ev.target, ev.event, fn, iterRaw, hasIdx, rtPtr);
+    }
+    // ---- v-if nodes nested directly inside this v-for iteration ----
+    // The compiler picks up `<x v-if="...">` children of the loop template
+    // and emits CompiledConditional records into iter->subPage.conditionals.
+    // BuildCondInIter compiles each one against the loop scope and recurses
+    // into nested v-if (v-if inside v-if inside v-for) automatically.
+    std::string loopVar  = rt.spec->loopVar;
+    std::string indexVar = rt.spec->indexVar;
+    for (auto& c : iter->subPage.conditionals) {
+        auto cr = BuildCondInIter(c, locals, loopVar, indexVar, iterRaw, hasIdx);
+        if (cr) iter->conditionals.push_back(std::move(cr));
+    }
+
+    // Rebind any persistent C-level callbacks (ui_widget_on_click etc.) onto
+    // the freshly-mounted iteration subtree. Keyed by widget HTML id, so
+    // <button id="btn_x"> inside a v-for keeps its handler across re-mounts.
+    if (iter->mountedRoot) {
+        ui::GetContext().RebindWidgetCallbacks(iter->mountedRoot.get());
+        DispatchMountHooks(iter->mountedRoot.get());
+    }
+
+    return iter;
+}
+
+void PageState::WireQuickJSEvent(Widget* target, const std::string& evName,
+                                  const std::string& sourceJs) {
+    if (!target || !jsRt_) return;
+    JSContext* ctx = jsRt_->ctx();
+
+    std::string rewritten = ui::uix::RewriteTemplateExpr(sourceJs);
+    JSValue fn = jsRt_->CompileHandlerClosure(rewritten);
+    if (JS_IsException(fn)) {
+        errors_.push_back("@" + evName + " compile error: " + jsRt_->lastError() +
+                          "\n  source: " + sourceJs);
+        return;
+    }
+    jsEventFns_.push_back(fn);
+
+    auto callHandler = [this, ctx, fn](JSValue arg) {
+        JSValue argv[1] = { arg };
+        JSValue r = JS_Call(ctx, fn, jsState_, 1, argv);
+        if (JS_IsException(r)) {
+            JSValue exc = JS_GetException(ctx);
+            const char* msg = JS_ToCString(ctx, exc);
+            std::string s = msg ? msg : "(no message)";
+            if (msg) JS_FreeCString(ctx, msg);
+            JS_FreeValue(ctx, exc);
+            errors_.push_back("event handler threw: " + s);
+        }
+        JS_FreeValue(ctx, r);
+        JS_FreeValue(ctx, arg);
+    };
+
+    // MouseEvent → JS `{ x, y, delta, button }`. Each invocation builds a
+    // fresh object; the closure callee owns it via JS_FreeValue in callHandler.
+    auto mouseEventValue = [ctx](const ui::MouseEvent& e) -> JSValue {
+        JSValue obj = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, obj, "x",      JS_NewFloat64(ctx, e.x));
+        JS_SetPropertyStr(ctx, obj, "y",      JS_NewFloat64(ctx, e.y));
+        JS_SetPropertyStr(ctx, obj, "delta",  JS_NewFloat64(ctx, e.delta));
+        JS_SetPropertyStr(ctx, obj, "button", JS_NewInt32(ctx, e.leftBtn ? 0 : -1));
+        return obj;
+    };
+
+    if (evName == "click") {
+        target->onClick = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "mousedown") {
+        target->onMouseDownHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "mousemove") {
+        target->onMouseMoveHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "mouseup") {
+        target->onMouseUpHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "wheel") {
+        target->onMouseWheelHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "dblclick") {
+        target->onMouseDblClickHook = [callHandler, mouseEventValue](const ui::MouseEvent& e) {
+            callHandler(mouseEventValue(e));
+        };
+    } else if (evName == "submit") {
+        target->onSubmitHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "focus") {
+        target->onFocusHook = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "blur") {
+        target->onBlurHook  = [callHandler]() { callHandler(JS_UNDEFINED); };
+    } else if (evName == "change" || evName == "input") {
+        target->onValueChanged = [callHandler, ctx](bool v) {
+            callHandler(JS_NewBool(ctx, v));
+        };
+        target->onTextChanged = [callHandler, ctx](const std::wstring& v) {
+            std::string utf8 = ToUtf8(v);
+            callHandler(JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+        };
+        target->onFloatChanged = [callHandler, ctx](float v) {
+            callHandler(JS_NewFloat64(ctx, static_cast<double>(v)));
+        };
+    } else {
+        errors_.push_back("@" + evName + " not supported on QuickJS path");
+    }
+}
+
+void PageState::WireQuickJSModelWrite(Widget* target, const std::string& propName) {
+    if (!target || !jsRt_) return;
+    JSContext* ctx = jsRt_->ctx();
+
+    if (dynamic_cast<TextInputWidget*>(target) ||
+        dynamic_cast<TextAreaWidget*>(target)) {
+        target->onTextChanged = [this, ctx, propName](const std::wstring& v) {
+            std::string utf8 = ToUtf8(v);
+            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
+                              JS_NewStringLen(ctx, utf8.data(), utf8.size()));
+        };
+    } else if (dynamic_cast<CheckBoxWidget*>(target) ||
+               dynamic_cast<ToggleWidget*>(target) ||
+               dynamic_cast<RadioButtonWidget*>(target)) {
+        target->onValueChanged = [this, ctx, propName](bool v) {
+            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
+                              JS_NewBool(ctx, v));
+        };
+    } else if (dynamic_cast<SliderWidget*>(target) ||
+               dynamic_cast<NumberBoxWidget*>(target) ||
+               dynamic_cast<ProgressBarWidget*>(target)) {
+        target->onFloatChanged = [this, ctx, propName](float v) {
+            double dv = static_cast<double>(v);
+            JSValue cur = JS_GetPropertyStr(ctx, jsState_, propName.c_str());
+            if (JS_IsNumber(cur)) {
+                double n; JS_ToFloat64(ctx, &n, cur);
+                if (std::floor(n) == n) dv = std::round(dv);
+            }
+            JS_FreeValue(ctx, cur);
+            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
+                              JS_NewFloat64(ctx, dv));
+        };
+    } else if (auto* combo = dynamic_cast<ComboBoxWidget*>(target)) {
+        // ComboBox emits onSelectionChanged (int idx), NOT onFloatChanged —
+        // wiring onFloatChanged was a dead branch and v-model on <select>
+        // never updated state.
+        combo->onSelectionChanged = [this, ctx, propName](int idx) {
+            JS_SetPropertyStr(ctx, jsState_, propName.c_str(),
+                              JS_NewInt32(ctx, idx));
+        };
+    }
+}
+
+}  // namespace ui::page

@@ -1,0 +1,120 @@
+#pragma once
+
+#ifndef UI_API
+  #if defined(UI_CORE_STATIC)
+    #define UI_API
+  #elif defined(UI_CORE_BUILDING)
+    #define UI_API __declspec(dllexport)
+  #else
+    #define UI_API __declspec(dllimport)
+  #endif
+#endif
+
+#include <d2d1_1.h>
+#include <dwrite.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+#include <unordered_map>
+#include <memory>
+#include <cstdint>
+
+#include "handle_table.h"
+#include "context_menu.h"
+
+using Microsoft::WRL::ComPtr;
+
+namespace ui {
+
+class UiWindowImpl;  // forward
+
+class UI_API Context {
+public:
+    // ctor/dtor 必须显式声明在这里 + 定义在 ui_context.cpp。否则编译器会在
+    // 每个包含本头的 TU 里自动展开 windows_ 的析构 →
+    // std::unique_ptr<UiWindowImpl>::~unique_ptr() 要求 UiWindowImpl 完整类型，
+    // 而本文件只 forward-declare 了它（MSVC/clang-cl 严格，会报
+    // "invalid application of 'sizeof' to incomplete type"）。
+    Context();
+    ~Context();
+    Context(const Context&) = delete;
+    Context& operator=(const Context&) = delete;
+
+    bool Init();
+    void Shutdown();
+    bool IsShuttingDown() const { return shuttingDown_; }
+
+    // Shared COM factories
+    ID2D1Factory1*      D2DFactory()  { return d2dFactory_.Get(); }
+    IDWriteFactory*     DWFactory()   { return dwFactory_.Get(); }
+    IWICImagingFactory* WICFactory()  { return wicFactory_.Get(); }
+
+    // Handle table for widgets
+    HandleTable handles;
+
+    // Menu registry
+    uint64_t RegisterMenu(ContextMenuPtr menu);
+    ContextMenuPtr GetMenu(uint64_t id) const;
+    void RemoveMenu(uint64_t id);
+
+    // Window registry
+    uint64_t RegisterWindow(std::unique_ptr<UiWindowImpl> win);
+    UiWindowImpl* GetWindow(uint64_t id) const;
+    UiWindowImpl* FirstWindow() const;
+    void RemoveWindow(uint64_t id);
+    void InvalidateAllWindows();
+    // Re-evaluates per-window animation timers (toggle/checkbox/etc.). Needed
+    // whenever a binding application or external setter flips a widget into
+    // an animating state outside an event handler — without this, the timer
+    // never starts and the animation flag is set but nobody ticks it.
+    void UpdateAnimTimers();
+    bool HasWindows() const { return !windows_.empty(); }
+
+    // Called by Widget destructor so windows can null out any cached
+    // raw pointer to the dying widget (hovered / pressed / focused /
+    // tooltip). Avoids UAF when v-for / v-if destroys an iteration
+    // while the cursor is still on it.
+    void NotifyWidgetDestroyed(class Widget* w);
+
+    // ---- Persistent C-callback registry, keyed by widget HTML id ----
+    // ui_widget_on_click and friends record the callback here in addition to
+    // setting it on the widget instance. When v-if/v-for tears the widget
+    // down and re-mounts a fresh one with the same id, the runtime calls
+    // RebindWidgetCallbacks(newWidget) to copy the entry back onto the new
+    // instance. Without this the C handler dies with the old widget.
+    struct WidgetCallbacks {
+        std::function<void()>                       onClick;
+        std::function<void(bool)>                   onValueChanged;
+        std::function<void(const std::wstring&)>    onTextChanged;
+        std::function<void(float)>                  onFloatChanged;
+    };
+    void SetClickCallback(const std::string& id, std::function<void()> cb);
+    void SetValueCallback(const std::string& id, std::function<void(bool)> cb);
+    void SetTextCallback(const std::string& id, std::function<void(const std::wstring&)> cb);
+    void SetFloatCallback(const std::string& id, std::function<void(float)> cb);
+    // Walk a widget subtree and re-attach any persistent callbacks. Called
+    // by page_state v-if mount and v-for iteration build paths.
+    void RebindWidgetCallbacks(class Widget* root);
+
+private:
+    ComPtr<ID2D1Factory1>      d2dFactory_;
+    ComPtr<IDWriteFactory>     dwFactory_;
+    ComPtr<IWICImagingFactory> wicFactory_;
+
+    std::unordered_map<uint64_t, std::unique_ptr<UiWindowImpl>> windows_;
+    uint64_t nextWindowId_ = 1;
+
+    // Persistent widget callback registry — survives v-if/v-for remount.
+    std::unordered_map<std::string, WidgetCallbacks> widgetCallbacks_;
+
+    std::unordered_map<uint64_t, ContextMenuPtr> menus_;
+    uint64_t nextMenuId_ = 1;
+
+    bool initialized_ = false;
+    bool comInitialized_ = false;
+    bool shuttingDown_ = false;
+};
+
+// Global context singleton
+UI_API Context& GetContext();
+
+} // namespace ui

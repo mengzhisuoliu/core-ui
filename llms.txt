@@ -1,0 +1,44 @@
+# CORE UI
+
+> A modern Windows desktop UI framework: 8.4 MB single DLL, pure C API (250+ functions), Direct2D / Direct3D 11 hardware-accelerated rendering, Fluent 2 design language. The primary authoring format is `.uix` — a Vue 3-style single-file component (`<window>` + `<script>` + `<style>` + `<template>`) evaluated in-process by an embedded QuickJS-NG runtime. Purpose-built to be driven by LLMs and AI agents: all public types are plain C (uint64_t handles, POD structs), all UI is described in a Vue/HTML-shaped template language, and a single file (`docs/uix-ai-guide.md`) contains everything an AI needs to generate a complete application. Since 1.1.0, a full event-injection API (`ui_debug_*`, 60+ functions) lets agents operate any control without real mouse / keyboard, enabling closed-loop UI generation: emit code → build → click / type / screenshot → self-verify.
+
+Why this matters for AI code generation:
+
+- **`.uix` = Vue 3 SFC** — LLM training data is dominated by Vue / React / HTML far more than any desktop UI framework; templates + `data/computed/methods` come out right the first time.
+- **Pure C ABI** — no C++ templates, no std::*, no inheritance; LLMs rarely hallucinate type errors.
+- **Reactive bindings** — `{{ expr }}` / `:attr` / `v-if` / `v-for` / `v-model` / `@click` auto-track dependencies and incrementally re-render.
+- **One-file cheatsheet** — `docs/uix-ai-guide.md` is the only file an agent needs to fetch.
+- **Stable naming** — `ui_<noun>_<verb>` / `Ui<Noun>` patterns; predictable and greppable.
+- **Closed-loop self-verification** — `ui_debug_*` event injection + Named Pipe IPC let agents click / type / screenshot programmatically.
+
+## For AI agents (start here)
+
+- [.uix AI Guide (complete cheatsheet)](docs/uix-ai-guide.md): single-file, self-contained guide with `.uix` file structure, template syntax, script API, CSS subset, widget list, and runnable examples. **Fetch this first.**
+- [.uix Detailed Guide](docs/uix-guide.md): full Vue 3 SFC reference — script / CSS / widgets / cookbook / limitations.
+- [Debug & Automation](docs/debug-simulation.md): event-injection API — how an agent can click / type / select menu items / screenshot programmatically to verify its own generated UI.
+- [API Index](UI_CORE_API.md): full list of exported C functions, grouped by module.
+- [C API Reference](docs/c-api.md): parameter-level detail for every function.
+- [.ui Markup Reference](docs/markup.md): legacy `.ui` XML grammar (compatibility path; new code should prefer `.uix`).
+
+## Docs
+
+- [Getting Started](docs/getting-started.md): integration guide (CMake + MSVC / clang-cl).
+- [Controls](docs/controls.md): per-control spec (properties, events, defaults).
+- [Layout](docs/layout.md): Flexbox / percentage / absolute positioning.
+- [Design System](docs/design-system.md): Fluent 2 color tokens, spacing, typography.
+- [Internationalization](docs/i18n.md): `.lang` files and `$t('key')` references.
+- [.ui Markup AI Guide](docs/ai-guide.md): legacy `.ui` XML cheatsheet (compatibility).
+
+## Examples
+
+- [Demo .uix source](demo/ui_demo.uix): 12-page single-file component covering reactive state, lists, events, layout, theming, and i18n.
+- [Demo C glue](demo/ui_demo_uix.cpp): ~60 lines — load `.uix` from string, install language packs, open window.
+- [Language packs](demo/lang/): `ui_demo_zh.lang` and `ui_demo_en.lang` samples.
+
+## Meta
+
+- Platform: Windows 10 (1709+) (x86_64).
+- Build: CMake 3.20+ with MSVC 2019+ or clang-cl (C++17). MinGW not supported.
+- Script runtime: QuickJS-NG v0.14.0 (ES2020+), embedded in-process.
+- License: MIT.
+- Version: 1.5.0.42 (see [VERSION](VERSION)).
