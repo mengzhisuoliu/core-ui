@@ -38,6 +38,11 @@
        flex-wrap: wrap; }              /* HBox 多行换行 (build 10+) */
 ```
 
+> **注意：`<div>` 默认 `flex-direction: column` 且 `gap: 4px`**（沿用上面
+> VBox/HBox 的默认值，**不**是 CSS 标准的 `gap: 0`）。要做"工具栏紧贴
+> canvas"这种零间距布局，必须显式写 `gap: 0`，否则会露出父背景的 4px
+> 缝。`flex-direction: row` 的 `<div>` 同理。
+
 `min-width` / `max-width` / `min-height` / `max-height` 接受 `%` 单位（按 parent
 内容尺寸解析，build 9+），用于"min-width: 48% 做 2 列瓦片"等 CSS 模式。
 

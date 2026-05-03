@@ -41,9 +41,9 @@ Context& GetContext() {
 Context::Context() = default;
 Context::~Context() {
     // Mark shutting down so any Widget destructors that run during
-    // global teardown (golden_runner exits without calling ui_shutdown,
-    // for example) skip the NotifyWidgetDestroyed → window lookup,
-    // which would otherwise touch already-destroyed map entries.
+    // global teardown (process exits without calling ui_shutdown) skip
+    // the NotifyWidgetDestroyed → window lookup, which would otherwise
+    // touch already-destroyed map entries.
     shuttingDown_ = true;
 }
 

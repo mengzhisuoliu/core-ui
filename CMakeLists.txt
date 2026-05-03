@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 set(UI_CORE_VERSION "1.5.0")
-set(UI_CORE_INTERNAL_VERSION "42")
+set(UI_CORE_INTERNAL_VERSION "46")
 project(core-ui-project VERSION ${UI_CORE_VERSION} LANGUAGES C CXX)
 
 set(UI_CORE_VERSION_TAG "v${PROJECT_VERSION}")
@@ -21,8 +21,7 @@ include(cmake/UiCoreHelpers.cmake)
 if(NOT MSVC)
     message(FATAL_ERROR
         "core-ui only supports MSVC / clang-cl on Windows. "
-        "Run from a Visual Studio Developer Command Prompt, "
-        "or call vcvars64.bat before invoking cmake.")
+        "Use scripts/build-clang-cl.ps1 or a Visual Studio Developer prompt.")
 endif()
 
 # 默认 /MD（动态 CRT）。下游需要 vcredist；如果想要"纯单 DLL 零依赖"的发布，
@@ -182,15 +181,21 @@ ui_core_embed_text(ui-demo-uix FILE demo/ui_demo.uix         OUT app_uix.embed.h
 ui_core_embed_text(ui-demo-uix FILE demo/lang/ui_demo_zh.lang OUT lang_zh.embed.h VAR k_lang_zh)
 ui_core_embed_text(ui-demo-uix FILE demo/lang/ui_demo_en.lang OUT lang_en.embed.h VAR k_lang_en)
 
-target_compile_definitions(core-ui
-    PUBLIC
-        UI_CORE_VERSION_TAG="${UI_CORE_VERSION_TAG}"
-        UI_CORE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
-        UI_CORE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
-        UI_CORE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
-        UI_CORE_VERSION_BUILD=${UI_CORE_INTERNAL_VERSION}
-        UI_CORE_INTERNAL_VERSION=${UI_CORE_INTERNAL_VERSION}
+set(UI_CORE_VERSION_DEFS
+    UI_CORE_VERSION_TAG="${UI_CORE_VERSION_TAG}"
+    UI_CORE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+    UI_CORE_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+    UI_CORE_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+    UI_CORE_VERSION_BUILD=${UI_CORE_INTERNAL_VERSION}
+    UI_CORE_INTERNAL_VERSION=${UI_CORE_INTERNAL_VERSION}
 )
+target_compile_definitions(core-ui PUBLIC ${UI_CORE_VERSION_DEFS})
+# core-ui-static 是并行的独立 target（fat lib 用），同样要注入版本宏 ——
+# 否则 ui_core.h 里的 #ifndef 默认值 1.0.0.1 生效，下游静态链接拿到的
+# ui_core_version_string() 永远报错版本。
+if(TARGET core-ui-static)
+    target_compile_definitions(core-ui-static PUBLIC ${UI_CORE_VERSION_DEFS})
+endif()
 
 if(WIN32)
     if(UI_CORE_STATIC)
@@ -222,7 +227,7 @@ install(
 
 # 文档：UI_CORE_API.md 是目录页，里面的链接指向 docs/*.md，必须一起带上。
 install(
-    FILES UI_CORE_API.md README.md
+    FILES UI_CORE_API.md README.md CHANGELOG.md
     DESTINATION "${UI_CORE_RELEASE_DIR_NAME}"
 )
 install(
@@ -290,5 +295,13 @@ add_custom_target(release-package
 set(_release_deps core-ui)
 if(UI_CORE_BUILD_STATIC_ARCHIVE AND TARGET core-ui-static)
     list(APPEND _release_deps core-ui-static)
+    # 同时把 fat lib 拉进来 —— install 装的 lib/static/core-ui.lib 是
+    # core-ui-fat.lib（core-ui-static + qjs bundle）。仅依赖 core-ui-static
+    # 时 release-package 不会触发 fat lib 重建，install 拷过去的是旧 fat。
+    # 之前踩过：dynamic build 改了源 → release-package → release/lib/static/
+    # 还是几次构建之前的版本，下游静态链接后行为没变。
+    if(TARGET core-ui-fat-static)
+        list(APPEND _release_deps core-ui-fat-static)
+    endif()
 endif()
 add_dependencies(release-package ${_release_deps})

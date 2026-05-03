@@ -30,6 +30,16 @@ using WidgetPtr = std::shared_ptr<class Widget>;
 enum class LayoutAlign   { Start, Center, End, Stretch };
 enum class LayoutJustify { Start, Center, End, SpaceBetween, SpaceAround };
 
+// CSS display semantic. Matters for flex cross-axis sizing:
+// - Block: default. cross-axis stretches with align-items: stretch (CSS spec
+//   for `display: block` flex items with auto cross-size).
+// - Inline / InlineBlock: intrinsic cross-size. Doesn't stretch even when the
+//   container is align-items: stretch — uses SizeHint instead. Position still
+//   honors align-items / align-self. Matches CSS `display: inline*` behavior
+//   for flex items.
+// - None: collapses (visible=false).
+enum class Display { Block, Inline, InlineBlock, None };
+
 // ---- CSS cursor keyword → logical cursor ----
 // The window translates this to a Win32 IDC_* when painting the hover cursor.
 enum class CursorKind {
@@ -87,10 +97,23 @@ public:
     // patterns like `min-width: 48%` to make 2 cells per row via flex-wrap.
     float percentMinW = -1, percentMinH = -1;
     float percentMaxW = -1, percentMaxH = -1;
+    // CSS align-self override on a flex item. -1 = inherit container's
+    // align-items (default). Otherwise cast back to LayoutAlign
+    // (Start/Center/End/Stretch) — used by VBox/HBox cross-axis layout.
+    int alignSelfOverride = -1;
+    // CSS display. Block = stretch in cross-axis; Inline/InlineBlock = use
+    // SizeHint cross-axis (intrinsic-sized, no stretch). Set by factory per
+    // tag default (label/span/a/etc → Inline, others → Block) and overridable
+    // via CSS `display:`.
+    Display display = Display::Block;
 
     // ---- Absolute positioning ----
     bool positionAbsolute = false;
     float posLeft = -1, posTop = -1, posRight = -1, posBottom = -1;  // -1 = not set
+    // Raw CSS for sides whose value depends on parent size (% or calc()).
+    // Resolved at layout time (parent rect known); empty string falls back to
+    // the eager pos*Left/etc above. Lets `top: calc(50% - 20px)` work.
+    std::string posLeftRaw, posTopRaw, posRightRaw, posBottomRaw;
 
     // ---- Padding (inner space) ----
     float padL = 0, padT = 0, padR = 0, padB = 0;
@@ -163,7 +186,10 @@ public:
     D2D1_COLOR_F bgColor = {0, 0, 0, 0};
     std::function<D2D1_COLOR_F()> bgColorFn;  // dynamic color (e.g. theme-aware)
 
-    // CSS gradient background. When set, rendered instead of bgColor.
+    // CSS gradient background. A single CSS rule may produce multiple layers
+    // (comma-separated linear-gradient(...), linear-gradient(...), ...). Each
+    // layer carries its own tile size / position so patterns like the classic
+    // 4-layer checkerboard work.
     struct BgGradient {
         enum Kind { Linear, Radial };
         Kind kind = Linear;
@@ -177,9 +203,16 @@ public:
             float position = -1.0f;  // 0..1 explicit, -1 = auto-distribute
         };
         std::vector<Stop> stops;
+        // CSS background-size + background-position per layer.
+        // tileW / tileH < 0 → no tiling, paint once across the full widget rect
+        //                    (default — single-layer gradients keep old behavior).
+        // tileW / tileH > 0 → render one tile of that size and repeat-wrap it
+        //                    across the widget rect at offset (posX, posY).
+        float tileW = -1.0f, tileH = -1.0f;
+        float posX = 0.0f, posY = 0.0f;
     };
     bool hasBgGradient = false;
-    BgGradient bgGradient;
+    std::vector<BgGradient> bgGradients;
 
     // ---- CSS style overrides (used when non-sentinel). Controls in their
     //      OnDraw should prefer these before falling back to theme defaults.

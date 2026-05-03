@@ -185,10 +185,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 源 `app.uix` 改了 ninja/make 自动重新生成 `.embed.h` 触发重新编译，不用手动 xxd。
 
 **`.uix` 之外**：`.ui`（旧 markup）、`.lang`（i18n）、纯文本任何东西都可以这样
-内嵌 —— 只要对应加载 API 接受 `const char*` 就行。`ui-demo-uix.exe` 自己就是
-这样做的：`ui_demo.uix` + 中英 lang 全内嵌，单文件运行（参见
-`demo/ui_demo_uix.cpp` + 顶层 `CMakeLists.txt` 里
-`ui_core_embed_text(ui-demo-uix ...)`）。
+内嵌 —— 只要对应加载 API 接受 `const char*` 就行。`ui-demo.exe` 自己就是这样
+做的：app.ui + 中英 lang 全内嵌，单文件运行（参见 `demo/app.cpp` + 顶层
+`CMakeLists.txt` 里 `ui_core_embed_text(ui-demo ...)`）。
 
 ### 图片 / 外部 CSS（自 build 19）
 

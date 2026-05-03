@@ -83,7 +83,12 @@ private:
 // Button type: "default" = standard gray, "primary" = accent filled
 enum class ButtonType { Default, Primary };
 
-class UI_API ButtonWidget : public Widget {
+// Inherits HBoxWidget so a "no text + has children" button (typical icon-only
+// button — <button><svg/></button>) lays its children out with flex semantics
+// (align-items / justify-content / gap from CSS), instead of stacking them at
+// (0,0) like the base Widget::DoLayout. Text-bearing buttons keep the legacy
+// path: OnDraw owns text + icon rendering, children pinned by Widget::DoLayout.
+class UI_API ButtonWidget : public HBoxWidget {
 public:
     explicit ButtonWidget(const std::wstring& text) : text_(text) { focusable = true; }
 
@@ -98,6 +103,7 @@ public:
     void SetCustomBgColor(const D2D1_COLOR_F& c) { customBgColor_ = c; hasCustomBgColor_ = true; ui::GetContext().InvalidateAllWindows(); }
 
     void OnDraw(Renderer& r) override;
+    void DoLayout() override;
     bool OnMouseMove(const MouseEvent& e) override;
     bool OnMouseDown(const MouseEvent& e) override;
     bool OnMouseUp(const MouseEvent& e) override;

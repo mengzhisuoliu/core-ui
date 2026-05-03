@@ -313,8 +313,8 @@ ui_debug_pump();                                  // 处理消息队列
 ui_window_invoke_sync(win, my_fn, userdata);
 ```
 
-共 60+ 个 `ui_debug_*` 函数。demo 还内置了 `\\.\pipe\ui_core_debug` 命名管道
-（`ui_debug_server_start(win, NULL)` 启动），用 PowerShell / Python 一行就能驱动。
+共 60+ 个 `ui_debug_*` 函数。demo 还内置了 `\\.\pipe\ui_core_debug` 命名管道，
+用 PowerShell / Python 一行就能驱动，参考 `scripts/debug-smoke.ps1`。
 
 ## .uix 页面 i18n（自 1.4.0 build 20）
 
@@ -373,9 +373,9 @@ UI_API void ui_asset_reset            (void);
 
 ```c
 ui_init();
-ui_asset_register_dir("C:/path/to/myapp/assets");
-/* 模板里 <img src="logo.png"> → 读 C:/path/to/myapp/assets/logo.png
-   模板里 <link href="theme.css"> → 读 C:/path/to/myapp/assets/theme.css */
+ui_asset_register_dir("E:/myapp/assets");
+/* 模板里 <img src="logo.png"> → 读 E:/myapp/assets/logo.png
+   模板里 <link href="theme.css"> → 读 E:/myapp/assets/theme.css */
 UiPage p = ui_page_load_file(L"app.uix");
 ui_run();
 ```

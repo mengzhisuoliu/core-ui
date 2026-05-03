@@ -23,6 +23,15 @@ void LabelWidget::OnDraw(Renderer& r) {
     else                   c = theme::kBtnText();
     float fs = (css.fontSize > 0) ? css.fontSize : fontSize_;
 
+    // CSS padding shrinks the text-render area; bg/border still fill the
+    // outer rect (Widget::OnDraw handled that already).
+    D2D1_RECT_F textRect = {
+        rect.left + padL,
+        rect.top + padT,
+        rect.right - padR,
+        rect.bottom - padB,
+    };
+
     // 选区绘制（仅 selectable + 单行场景）：先填选中背景，再覆盖一段不同色
     // 文字。多行/wrap 场景暂不支持文本选中。
     if (selectable && HasSelection() && !wrap_) {
@@ -32,7 +41,7 @@ void LabelWidget::OnDraw(Renderer& r) {
         int e = std::max(selectionStart_, selectionEnd_);
         std::wstring before = text_.substr(0, s);
         std::wstring sel    = text_.substr(s, e - s);
-        float x1 = rect.left + r.MeasureTextWidth(before, fs, nullptr);
+        float x1 = textRect.left + r.MeasureTextWidth(before, fs, nullptr);
         float x2 = x1 + r.MeasureTextWidth(sel, fs, nullptr);
         D2D1_COLOR_F selBg;
         if (focused_) {
@@ -42,7 +51,7 @@ void LabelWidget::OnDraw(Renderer& r) {
                   : (dark ? theme::Rgba(0xFF, 0xFF, 0xFF, 0.18f)
                           : theme::Rgba(0x00, 0x00, 0x00, 0.18f));
         }
-        D2D1_RECT_F selRect = {x1, rect.top + 2, x2, rect.bottom - 2};
+        D2D1_RECT_F selRect = {x1, textRect.top + 2, x2, textRect.bottom - 2};
         r.FillRect(selRect, selBg);
 
         D2D1_COLOR_F selFg = c;
@@ -56,14 +65,14 @@ void LabelWidget::OnDraw(Renderer& r) {
         }
         auto vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
         // 选区前后用 c 画，选区内用 selFg 画（如有）
-        r.PushClip({rect.left, rect.top, x1, rect.bottom});
-        r.DrawText(text_, rect, c, fs, align_, weight, vAlign, false);
+        r.PushClip({textRect.left, textRect.top, x1, textRect.bottom});
+        r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, false);
         r.PopClip();
-        r.PushClip({x1, rect.top, x2, rect.bottom});
-        r.DrawText(text_, rect, customSelFg ? selFg : c, fs, align_, weight, vAlign, false);
+        r.PushClip({x1, textRect.top, x2, textRect.bottom});
+        r.DrawText(text_, textRect, customSelFg ? selFg : c, fs, align_, weight, vAlign, false);
         r.PopClip();
-        r.PushClip({x2, rect.top, rect.right, rect.bottom});
-        r.DrawText(text_, rect, c, fs, align_, weight, vAlign, false);
+        r.PushClip({x2, textRect.top, textRect.right, textRect.bottom});
+        r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, false);
         r.PopClip();
         return;
     }
@@ -74,11 +83,11 @@ void LabelWidget::OnDraw(Renderer& r) {
     // 多行 wrap：rect 紧贴内容块 → CENTER ≈ NEAR，不会让段落塌到中间。
     auto vAlign = DWRITE_PARAGRAPH_ALIGNMENT_CENTER;
     if (wrap_ && maxLines_ > 0) {
-        r.PushClip(rect);
-        r.DrawText(text_, rect, c, fs, align_, weight, vAlign, true);
+        r.PushClip(textRect);
+        r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, true);
         r.PopClip();
     } else {
-        r.DrawText(text_, rect, c, fs, align_, weight, vAlign, wrap_);
+        r.DrawText(text_, textRect, c, fs, align_, weight, vAlign, wrap_);
     }
 }
 
@@ -92,7 +101,9 @@ void LabelWidget::SetSelectable(bool v) {
 int LabelWidget::CharIndexAtX(Renderer& r, float x) const {
     if (text_.empty()) return 0;
     float fs = (css.fontSize > 0) ? css.fontSize : fontSize_;
-    float relX = x - rect.left;
+    // 文本起点偏移 padL（OnDraw 把 textRect 内缩了）—— 不减 padding，
+    // padding 区域里的点击会算成下一个字符位置，跟视觉不符。
+    float relX = x - rect.left - padL;
     if (relX <= 0) return 0;
     int lo = 0, hi = (int)text_.size();
     while (lo < hi) {
@@ -179,12 +190,24 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
     if (fixedW > 0) {
         estW = fixedW;
     } else {
-        float asciiW = bold_ ? fontSize_ * 0.66f : fontSize_ * 0.62f;
-        for (wchar_t ch : text_) {
-            if (ch >= 0x2E80) estW += fontSize_;       /* CJK / 全角 */
-            else              estW += asciiW;
+        // 优先用 renderer 的精确测量（DWrite），估算只在 renderer 还没 attach
+        // 时兜底。Estimate 对粗体小字（如 11px bold "PRO"）会少算 → wrap=true
+        // 时把单行文字折成 2 行。+1px 防亚像素 ellipsis。
+        extern Renderer* g_activeRenderer;
+        if (g_activeRenderer && !text_.empty()) {
+            auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD
+                                : DWRITE_FONT_WEIGHT_NORMAL;
+            estW = g_activeRenderer->MeasureTextWidth(text_, fontSize_, nullptr, weight) + 1.0f;
+        } else {
+            float asciiW = bold_ ? fontSize_ * 0.66f : fontSize_ * 0.62f;
+            for (wchar_t ch : text_) {
+                if (ch >= 0x2E80) estW += fontSize_;       /* CJK / 全角 */
+                else              estW += asciiW;
+            }
         }
-        estW = std::max(60.0f, estW);
+        // 不再 floor 到 60px —— 否则 pill / badge / chip 这种"包裹文字"
+        // 的 label 在 align-self: flex-start 下也会被撑到 60px。短文本如
+        // "3 / 8"现在会按真实测量宽度（~28px）布局。
     }
     float w = estW;
     float h = fixedH > 0 ? fixedH : fontSize_ + 10.0f;
@@ -209,6 +232,8 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
             extern Renderer* g_activeRenderer;
             if (g_activeRenderer) {
                 auto weight = bold_ ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL;
+                // availW already had padL+padR subtracted → measured against
+                // text-area width.
                 float textH = g_activeRenderer->MeasureTextHeight(text_, availW, fontSize_, weight);
                 h = textH + 6.0f;
                 if (maxLines_ > 0) {
@@ -218,7 +243,9 @@ D2D1_SIZE_F LabelWidget::SizeHint() const {
             }
         }
     }
-    return {w, h};
+    // CSS padding 撑大 label 整体尺寸（badge / pill / chip 用），文字仍画
+    // 在 textRect = rect 减 padding 内。
+    return {w + padL + padR, h + padT + padB};
 }
 
 // ---- Button ----
@@ -327,6 +354,29 @@ void ButtonWidget::OnDraw(Renderer& r) {
         r.DrawText(text_, textRect, textColor, fontSize_, DWRITE_TEXT_ALIGNMENT_LEADING);
     } else {
         r.DrawText(text_, rect, textColor, fontSize_, DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+}
+
+void ButtonWidget::DoLayout() {
+    // Icon-only / pure-content button: <button><svg/></button> with no text.
+    // Delegate to HBox layout so CSS align-items / justify-content / gap on
+    // the button actually center the children inside its rect.
+    //
+    // Text-bearing button: OnDraw paints text (+ optional icon glyph) directly
+    // into rect. Children — if any were appended ad-hoc — fall back to the
+    // base Widget layout, matching legacy behavior.
+    //
+    // FirstPlainText (in widget_factory) returns the inter-tag whitespace
+    // (e.g. "\n  ") for <button>\n  <svg/>\n</button>, so empty() alone isn't
+    // enough — treat whitespace-only as no text.
+    bool hasText = false;
+    for (wchar_t c : text_) {
+        if (c != L' ' && c != L'\t' && c != L'\r' && c != L'\n') { hasText = true; break; }
+    }
+    if (!hasText && !children_.empty()) {
+        HBoxWidget::DoLayout();
+    } else {
+        Widget::DoLayout();
     }
 }
 

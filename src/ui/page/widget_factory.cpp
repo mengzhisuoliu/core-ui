@@ -309,27 +309,120 @@ void ApplyCommonStyle(Widget& w, const ui::css::ComputedStyle& s) {
         return !out.stops.empty();
     };
 
-    if (s.Has("background-color") || s.Has("background") || s.Has("background-image")) {
-        const std::string& bg = s.Has("background-image") ? s.Get("background-image")
-                              : (s.Has("background-color") ? s.Get("background-color")
-                                                            : s.Get("background"));
-        // Try gradient first.
+    // background-color / background-image / background — all three coexist per
+    // CSS spec: solid color is the bottom layer, gradients paint on top.
+    // Previously only one source was read (background-image > -color > shorthand)
+    // and the renderer used `else if` so any gradient hid the bgColor entirely.
+    if (s.Has("background-color")) {
+        ui::css::Color c;
+        if (ui::css::ParseColor(s.Get("background-color"), c)) w.bgColor = ToD2DColor(c);
+    }
+    // The image-ish source: prefer explicit background-image, else fall back
+    // to background shorthand. Both can carry comma-separated gradient layers
+    // and (per CSS spec) a trailing <color> in the LAST layer that becomes the
+    // background-color.
+    const std::string* bgImageish = nullptr;
+    if (s.Has("background-image"))   bgImageish = &s.Get("background-image");
+    else if (s.Has("background"))    bgImageish = &s.Get("background");
+
+    if (bgImageish && !bgImageish->empty()) {
+        auto pv = ui::css::ParseValue(*bgImageish);
+        // Group components into per-layer buckets at top-level commas.
+        std::vector<std::vector<ui::css::Component>> layers;
+        layers.emplace_back();
+        for (auto& c : pv.components) {
+            if (c.kind == ui::css::ComponentKind::Comma) layers.emplace_back();
+            else layers.back().push_back(c);
+        }
         bool gotGradient = false;
-        auto pv = ui::css::ParseValue(bg);
-        for (auto& comp : pv.components) {
-            if (comp.kind == ui::css::ComponentKind::Function) {
-                Widget::BgGradient g;
-                if (parseBgGradient(comp, g)) {
-                    w.hasBgGradient = true;
-                    w.bgGradient = std::move(g);
-                    gotGradient = true;
-                    break;
+        for (size_t i = 0; i < layers.size(); ++i) {
+            for (auto& c : layers[i]) {
+                if (c.kind == ui::css::ComponentKind::Function) {
+                    Widget::BgGradient g;
+                    if (parseBgGradient(c, g)) {
+                        w.bgGradients.push_back(std::move(g));
+                        gotGradient = true;
+                    }
+                } else if (c.kind == ui::css::ComponentKind::Color &&
+                           i + 1 == layers.size()) {
+                    // Trailing color in the last layer — CSS short-hand
+                    // background-color. Only set if -color hasn't already
+                    // explicitly set it.
+                    if (!s.Has("background-color")) {
+                        w.bgColor = D2D1_COLOR_F{c.color.r, c.color.g,
+                                                 c.color.b, c.color.a};
+                    }
                 }
             }
         }
-        if (!gotGradient) {
+        w.hasBgGradient = gotGradient;
+        // Plain `background: red` (no gradient, no -color set) — fall back to
+        // parsing the whole string as a color.
+        if (!gotGradient && !s.Has("background-color") && w.bgColor.a == 0) {
             ui::css::Color c;
-            if (ui::css::ParseColor(bg, c)) w.bgColor = ToD2DColor(c);
+            if (ui::css::ParseColor(*bgImageish, c)) w.bgColor = ToD2DColor(c);
+        }
+    }
+    // background-size — comma-separated list of <width> [<height>] pairs.
+    // Each pair binds to the corresponding gradient layer. CSS spec says the
+    // shorter list cycles to fill the longer; we follow that.
+    if (s.Has("background-size") && !w.bgGradients.empty()) {
+        auto pv = ui::css::ParseValue(s.Get("background-size"));
+        std::vector<std::vector<ui::css::Component>> buckets;
+        buckets.emplace_back();
+        for (auto& c : pv.components) {
+            if (c.kind == ui::css::ComponentKind::Comma) buckets.emplace_back();
+            else buckets.back().push_back(c);
+        }
+        auto resolveLen = [](const ui::css::Component& c) -> float {
+            if (c.kind == ui::css::ComponentKind::Length) {
+                double px = 0;
+                if (ui::css::ResolveLengthPx(c.length, 0, 14, 14, 0, 0, px))
+                    return static_cast<float>(px);
+            }
+            if (c.kind == ui::css::ComponentKind::Number) return static_cast<float>(c.number);
+            return -1.0f;
+        };
+        for (size_t i = 0; i < w.bgGradients.size() && !buckets.empty(); ++i) {
+            const auto& bucket = buckets[i % buckets.size()];
+            if (bucket.empty()) continue;
+            float bw = resolveLen(bucket[0]);
+            float bh = bucket.size() >= 2 ? resolveLen(bucket[1]) : bw;
+            if (bw > 0) w.bgGradients[i].tileW = bw;
+            if (bh > 0) w.bgGradients[i].tileH = bh;
+        }
+    }
+    // background-position — comma-separated list of <x> [<y>] pairs (px only
+    // for now; keywords like "top left" are ignored). Negative offsets ok.
+    if (s.Has("background-position") && !w.bgGradients.empty()) {
+        auto pv = ui::css::ParseValue(s.Get("background-position"));
+        std::vector<std::vector<ui::css::Component>> buckets;
+        buckets.emplace_back();
+        for (auto& c : pv.components) {
+            if (c.kind == ui::css::ComponentKind::Comma) buckets.emplace_back();
+            else buckets.back().push_back(c);
+        }
+        auto resolveLen = [](const ui::css::Component& c, bool& ok) -> float {
+            ok = false;
+            if (c.kind == ui::css::ComponentKind::Length) {
+                double px = 0;
+                if (ui::css::ResolveLengthPx(c.length, 0, 14, 14, 0, 0, px)) {
+                    ok = true; return static_cast<float>(px);
+                }
+            }
+            if (c.kind == ui::css::ComponentKind::Number) {
+                ok = true; return static_cast<float>(c.number);
+            }
+            return 0.0f;
+        };
+        for (size_t i = 0; i < w.bgGradients.size() && !buckets.empty(); ++i) {
+            const auto& bucket = buckets[i % buckets.size()];
+            if (bucket.empty()) continue;
+            bool okX = false, okY = false;
+            float bx = resolveLen(bucket[0], okX);
+            float by = bucket.size() >= 2 ? resolveLen(bucket[1], okY) : 0.0f;
+            if (okX) w.bgGradients[i].posX = bx;
+            if (okY) w.bgGradients[i].posY = by;
         }
     }
 
@@ -338,9 +431,17 @@ void ApplyCommonStyle(Widget& w, const ui::css::ComputedStyle& s) {
         try { w.opacity = std::stof(s.Get("opacity")); } catch (...) {}
     }
 
-    // Display: none → visible=false
-    if (s.Has("display") && s.Get("display") == "none") {
-        w.visible = false;
+    // Display:
+    // - none           → visible=false (collapse)
+    // - inline / inline-block → intrinsic cross-size (don't stretch)
+    // - block          → flex item that stretches (default for div etc.)
+    // - flex / grid 等 → 暂忽略，按当前 widget 既定行为走
+    if (s.Has("display")) {
+        const std::string& v = s.Get("display");
+        if      (v == "none")          w.visible = false;
+        else if (v == "inline")        w.display = Display::Inline;
+        else if (v == "inline-block")  w.display = Display::InlineBlock;
+        else if (v == "block")         w.display = Display::Block;
     }
 
     // Visibility: hidden → visible=false (we collapse the distinction)
@@ -560,6 +661,26 @@ void ApplyCommonStyle(Widget& w, const ui::css::ComputedStyle& s) {
             lbl->SetSelectable(v == "text" || v == "all");
         }
     }
+    // text-align — applies to LabelWidget. ButtonWidget hardcodes CENTER in
+    // its OnDraw, so this is a no-op on buttons.
+    if (s.Has("text-align")) {
+        if (auto* lbl = dynamic_cast<LabelWidget*>(&w)) {
+            const std::string& v = s.Get("text-align");
+            if      (v == "center")              lbl->Align(DWRITE_TEXT_ALIGNMENT_CENTER);
+            else if (v == "right" || v == "end") lbl->Align(DWRITE_TEXT_ALIGNMENT_TRAILING);
+            else if (v == "justify")             lbl->Align(DWRITE_TEXT_ALIGNMENT_JUSTIFIED);
+            else                                 lbl->Align(DWRITE_TEXT_ALIGNMENT_LEADING);
+        }
+    }
+    // align-self — per-child override of container's align-items (cross-axis).
+    if (s.Has("align-self")) {
+        const std::string& v = s.Get("align-self");
+        if      (v == "auto")                                w.alignSelfOverride = -1;
+        else if (v == "flex-start" || v == "start")          w.alignSelfOverride = (int)LayoutAlign::Start;
+        else if (v == "center")                              w.alignSelfOverride = (int)LayoutAlign::Center;
+        else if (v == "flex-end"  || v == "end")             w.alignSelfOverride = (int)LayoutAlign::End;
+        else if (v == "stretch")                             w.alignSelfOverride = (int)LayoutAlign::Stretch;
+    }
     if (s.Has("selected-color")) {
         D2D1_COLOR_F c;
         if (parseColor(s.Get("selected-color"), c)) {
@@ -617,13 +738,30 @@ void ApplyCommonStyle(Widget& w, const ui::css::ComputedStyle& s) {
         w.overflowHidden = (v == "hidden" || v == "clip");
     }
 
-    // Absolute positioning
+    // Absolute positioning. For each side, eager-resolve plain px / em / rem;
+    // % and calc() depend on the parent rect so they're stashed as raw strings
+    // and resolved at layout time (see ResolveAbsSide in widget.cpp).
     if (s.Has("position") && s.Get("position") == "absolute") {
         w.positionAbsolute = true;
-        if (s.Has("left"))   w.posLeft   = ResolvePx(s.Get("left"));
-        if (s.Has("top"))    w.posTop    = ResolvePx(s.Get("top"));
-        if (s.Has("right"))  w.posRight  = ResolvePx(s.Get("right"));
-        if (s.Has("bottom")) w.posBottom = ResolvePx(s.Get("bottom"));
+        auto setSide = [&](const char* prop, float& slot, std::string& rawSlot) {
+            if (!s.Has(prop)) return;
+            const std::string& v = s.Get(prop);
+            ui::css::Length len;
+            if (ui::css::ParseLength(v, len) && len.unit != ui::css::Unit::Auto &&
+                len.unit != ui::css::Unit::Percent) {
+                double px = 0;
+                if (ui::css::ResolveLengthPx(len, 0, 14, 14, 1920, 1080, px)) {
+                    slot = static_cast<float>(px);
+                    return;
+                }
+            }
+            // % or calc() (or unparseable) — defer to layout time.
+            rawSlot = v;
+        };
+        setSide("left",   w.posLeft,   w.posLeftRaw);
+        setSide("top",    w.posTop,    w.posTopRaw);
+        setSide("right",  w.posRight,  w.posRightRaw);
+        setSide("bottom", w.posBottom, w.posBottomRaw);
     }
 }
 
@@ -725,6 +863,12 @@ WidgetPtr ConstructByTag(const std::string& tag, const std::string& text,
         // 不需要换行（如导航文案）的，CSS 设 white-space: nowrap 或显式 wrap=false。
         auto lbl = std::make_shared<LabelWidget>(wtext);
         lbl->SetWrap(true);
+        // CSS `display: inline` semantics — intrinsic cross-size, doesn't
+        // stretch under align-items: stretch but still honors align-items:
+        // center / end for positioning. Matches DOM <label>/<span>/<a>.
+        // Override via CSS `display: block` for stretching, or
+        // `align-self: stretch` per-element opt-in.
+        lbl->display = Display::Inline;
         return lbl;
     }
     if (tag == "p") {
@@ -1037,6 +1181,30 @@ WidgetPtr BuildWidget(const ui::uix::Node& node, const ui::css::ComputedStyle& s
             if (a.name == "id") w->id = a.rawValue;
             // For text-like widgets: value attribute for input, alt for img, etc. — skipped in v0
         }
+    }
+
+    // CSS spec defaults for replaced / form / inline-image widgets — they all
+    // want intrinsic cross-axis sizing (don't honor align-items: stretch). User
+    // can opt back into stretching via CSS `display: block` or per-element
+    // `align-self: stretch`. ApplyCommonStyle below will overwrite if CSS
+    // explicitly sets `display:` so this default is purely a fallback.
+    // (LabelWidget / IconButtonWidget already handled in their factory branches:
+    //  Inline + InlineBlock respectively.)
+    if (dynamic_cast<ButtonWidget*>(w.get())          ||
+        dynamic_cast<CaptionButtonWidget*>(w.get())   ||
+        dynamic_cast<IconButtonWidget*>(w.get())      ||
+        dynamic_cast<ImageWidget*>(w.get())           ||
+        dynamic_cast<SvgWidget*>(w.get())             ||
+        dynamic_cast<TextInputWidget*>(w.get())       ||
+        dynamic_cast<TextAreaWidget*>(w.get())        ||
+        dynamic_cast<NumberBoxWidget*>(w.get())       ||
+        dynamic_cast<ComboBoxWidget*>(w.get())        ||
+        dynamic_cast<ToggleWidget*>(w.get())          ||
+        dynamic_cast<CheckBoxWidget*>(w.get())        ||
+        dynamic_cast<RadioButtonWidget*>(w.get())     ||
+        dynamic_cast<SliderWidget*>(w.get())          ||
+        dynamic_cast<ProgressBarWidget*>(w.get())) {
+        w->display = Display::InlineBlock;
     }
 
     // Apply CSS

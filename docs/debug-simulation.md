@@ -6,7 +6,7 @@
 - 端到端 UI 自动化测试
 - 脚本驱动演示 / 录屏
 - AI 代理操作 UI（例如对话式助手）
-- 回归验证（端到端 smoke + 关键路径回归）
+- 回归验证（每次发布前跑一遍 `scripts/debug-smoke.ps1`）
 
 ## 架构
 
@@ -39,8 +39,8 @@
 
 > **库级 pipe server（v1.4.0 build 8 起可用）**：`\\.\pipe\ui_core_debug` 协议
 > 实现在 core-ui 库内（`src/ui/ui_debug_server.cpp`），任何应用一行启用。详见
-> 本文末"Server API"一节。`.uix` demo（`demo/ui_demo_uix.cpp`，
-> 对应 `ui-demo-uix.exe`）使用这套 API，一行 `ui_debug_server_start(win, NULL)` 即可。
+> 本文末"Server API"一节。`.ui` demo（`demo/app.cpp`）和 `.uix` demo
+> （`demo/ui_demo_html.cpp`，对应 `ui-demo-uix.exe`）都已切换到这套 API。
 
 ## 控件 × 可模拟操作矩阵
 
@@ -375,8 +375,12 @@ UI_API int ui_debug_screenshot_widget(UiWindow win, UiWidget w, const wchar_t* o
 
 ### Demo 接入示例
 
-- `demo/ui_demo_uix.cpp`（`ui-demo-uix.exe`）—— 一行 `ui_debug_server_start(win, NULL)`，
-  完全使用 builtin 命令，无私有 handler
+- `demo/app.cpp`（`.ui` demo）—— 自定义 handler 处理 `nav` / `flyout` /
+  `scroll`（active-page fallback），其余命令走 builtin
+- `demo/ui_demo_html.cpp`（`.uix` demo，对应 `ui-demo-uix.exe`）—— 一行
+  `ui_debug_server_start`，无私有命令
+- `scripts/debug-smoke-uix.ps1` —— PowerShell 端到端 smoke：tree dump + hover +
+  click + screenshot + screenshot_widget + wheel + dialog/menu 状态查询
 
 ## 相关文件
 
@@ -385,4 +389,7 @@ UI_API int ui_debug_screenshot_widget(UiWindow win, UiWidget w, const wchar_t* o
 - `src/ui/ui_window.h/cpp` — `UiWindowImpl::Sim*` 内部事件派发 + `ScreenshotRegion`
 - `src/ui/context_menu.h/cpp` — `ContextMenu::SimulateClickIndex`
 - `src/ui/ui_api.cpp` — C API 实现
-- `demo/ui_demo_uix.cpp` — `.uix` demo (`ui-demo-uix.exe`) 接入示例
+- `demo/app.cpp` — `.ui` demo + 自定义 handler 示例
+- `demo/ui_demo_html.cpp` — `.uix` demo (`ui-demo-uix.exe`) 接入示例
+- `scripts/debug-smoke-uix.ps1` — 端到端 smoke 测试
+- `scripts/debug-smoke.ps1` — 跨 9 页的回归脚本

@@ -3,6 +3,7 @@
 #include "event.h"
 #include "theme.h"
 #include "ui_context.h"
+#include "css/value.h"
 
 #include <d2d1_1.h>
 #include <wrl/client.h>
@@ -11,6 +12,28 @@
 namespace ui {
 
 using Microsoft::WRL::ComPtr;
+
+namespace {
+// Resolve an absolute-position side value at layout time. raw is the CSS
+// string stashed at factory time when the value uses % or calc() (which
+// can't resolve without the parent size). Empty raw → return fallback (the
+// already-resolved px from posLeft/etc, or -1 sentinel).
+float ResolveAbsSide(const std::string& raw, float fallback, float parentSize) {
+    if (raw.empty()) return fallback;
+    auto pv = ui::css::ParseValue(raw);
+    for (const auto& c : pv.components) {
+        double px = 0;
+        if (c.kind == ui::css::ComponentKind::Length) {
+            if (ui::css::ResolveLengthPx(c.length, parentSize, 14, 14, 1920, 1080, px))
+                return static_cast<float>(px);
+        } else if (c.kind == ui::css::ComponentKind::Function && c.ident == "calc") {
+            if (ui::css::EvalCalc(c, parentSize, 14, 14, 1920, 1080, px))
+                return static_cast<float>(px);
+        }
+    }
+    return fallback;
+}
+}  // namespace
 
 // Out-of-line so the dtor body can reach Context::NotifyWidgetDestroyed
 // (the header only forward-declares Context). Required for windows to
@@ -213,6 +236,62 @@ ComPtr<ID2D1Brush> CreateBgGradientBrush(ID2D1RenderTarget* rt,
     return brush;
 }
 
+// Paint one CSS gradient layer into `rect`. When the layer has a tile size
+// set (background-size on the CSS rule), render the gradient into a tile-
+// sized off-screen bitmap and use a wrap-mode bitmap brush so D2D repeats
+// the tile across rect — that's how multi-layer checkerboard patterns work.
+void PaintGradientLayer(ID2D1RenderTarget* rt, const D2D1_RECT_F& rect,
+                        const Widget::BgGradient& layer, float radius) {
+    if (!rt || layer.stops.empty()) return;
+    bool tile = (layer.tileW > 0 && layer.tileH > 0);
+
+    if (!tile) {
+        auto brush = CreateBgGradientBrush(rt, rect, layer);
+        if (!brush) return;
+        if (radius > 0) {
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());
+        } else {
+            rt->FillRectangle(rect, brush.Get());
+        }
+        return;
+    }
+
+    // Tiled: build a one-tile bitmap, then BitmapBrush with WRAP across rect.
+    D2D1_SIZE_F tileSizeDip = D2D1::SizeF(layer.tileW, layer.tileH);
+    ComPtr<ID2D1BitmapRenderTarget> tileRT;
+    if (FAILED(rt->CreateCompatibleRenderTarget(tileSizeDip, tileRT.GetAddressOf()))) return;
+
+    D2D1_RECT_F tileRect = {0.0f, 0.0f, layer.tileW, layer.tileH};
+    auto tileBrush = CreateBgGradientBrush(tileRT.Get(), tileRect, layer);
+    if (!tileBrush) return;
+
+    tileRT->BeginDraw();
+    tileRT->Clear(D2D1::ColorF(0, 0, 0, 0));
+    tileRT->FillRectangle(tileRect, tileBrush.Get());
+    if (FAILED(tileRT->EndDraw())) return;
+
+    ComPtr<ID2D1Bitmap> tileBmp;
+    if (FAILED(tileRT->GetBitmap(tileBmp.GetAddressOf()))) return;
+
+    D2D1_BITMAP_BRUSH_PROPERTIES bbp = {
+        D2D1_EXTEND_MODE_WRAP,
+        D2D1_EXTEND_MODE_WRAP,
+        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+    };
+    D2D1_BRUSH_PROPERTIES bp = {};
+    bp.opacity = 1.0f;
+    bp.transform = D2D1::Matrix3x2F::Translation(rect.left + layer.posX, rect.top + layer.posY);
+
+    ComPtr<ID2D1BitmapBrush> bmpBrush;
+    if (FAILED(rt->CreateBitmapBrush(tileBmp.Get(), bbp, bp, bmpBrush.GetAddressOf()))) return;
+
+    if (radius > 0) {
+        rt->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), bmpBrush.Get());
+    } else {
+        rt->FillRectangle(rect, bmpBrush.Get());
+    }
+}
+
 }  // namespace
 
 void Widget::OnDraw(Renderer& r) {
@@ -224,20 +303,18 @@ void Widget::OnDraw(Renderer& r) {
     else if (pressed && stateColors.pressedBg) drawBg = stateColors.pressedBg();
     else if (hovered && stateColors.hoverBg)   drawBg = stateColors.hoverBg();
 
-    // Gradient takes priority over solid bgColor.
+    // CSS spec: solid bgColor is the bottom layer; gradients paint on top.
+    // Previously this was an `if/else if` so any gradient hid the bgColor —
+    // user couldn't put a custom base color under a checker-pattern overlay.
     float radius = (css.borderRadius >= 0) ? css.borderRadius : 0.0f;
-    if (hasBgGradient) {
-        auto brush = CreateBgGradientBrush(r.RT(), rect, bgGradient);
-        if (brush) {
-            if (radius > 0) {
-                r.RT()->FillRoundedRectangle(D2D1::RoundedRect(rect, radius, radius), brush.Get());
-            } else {
-                r.RT()->FillRectangle(rect, brush.Get());
-            }
-        }
-    } else if (drawBg.a > 0) {
+    if (drawBg.a > 0) {
         if (radius > 0) r.FillRoundedRect(rect, radius, radius, drawBg);
         else            r.FillRect(rect, drawBg);
+    }
+    if (hasBgGradient) {
+        for (const auto& layer : bgGradients) {
+            PaintGradientLayer(r.RT(), rect, layer, radius);
+        }
     }
 
     // Inset shadows paint AFTER bg so they sit on top of the fill.
@@ -309,11 +386,15 @@ void Widget::DoLayout() {
             auto hint = child->SizeHint();
             float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : cw);
             float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : 24.0f);
+            float pl = ResolveAbsSide(child->posLeftRaw,   child->posLeft,   cw);
+            float pr = ResolveAbsSide(child->posRightRaw,  child->posRight,  cw);
+            float pt = ResolveAbsSide(child->posTopRaw,    child->posTop,    ch);
+            float pb = ResolveAbsSide(child->posBottomRaw, child->posBottom, ch);
             float x = cx, y = cy;
-            if (child->posLeft >= 0) x = cx + child->posLeft;
-            else if (child->posRight >= 0) x = cx + cw - w - child->posRight;
-            if (child->posTop >= 0) y = cy + child->posTop;
-            else if (child->posBottom >= 0) y = cy + ch - h - child->posBottom;
+            if (pl >= 0) x = cx + pl;
+            else if (pr >= 0) x = cx + cw - w - pr;
+            if (pt >= 0) y = cy + pt;
+            else if (pb >= 0) y = cy + ch - h - pb;
             child->rect = {x, y, x + w, y + h};
         } else if (child->fixedW > 0 && child->fixedH > 0) {
             child->rect = {cx, cy, cx + child->fixedW, cy + child->fixedH};
@@ -545,12 +626,22 @@ void VBoxWidget::DoLayout() {
 
         y += child->marginT;
 
-        // Cross-axis (width + horizontal position)
+        // Cross-axis (width + horizontal position). align-self overrides
+        // container's align-items per-child when set.
+        LayoutAlign effAlign = (child->alignSelfOverride < 0)
+            ? crossAlign_
+            : static_cast<LayoutAlign>(child->alignSelfOverride);
+        // CSS display: inline / inline-block items have intrinsic cross-size
+        // and don't honor align-items: stretch (use SizeHint instead). User
+        // explicit align-self: stretch opt-in still wins.
+        bool intrinsic = (child->display == Display::Inline ||
+                          child->display == Display::InlineBlock) &&
+                         child->alignSelfOverride < 0;
         float availW = cw - child->marginL - child->marginR;
         float childW;
         if (child->fixedW > 0) {
             childW = std::clamp(child->fixedW, child->minW, child->maxW);
-        } else if (crossAlign_ == LayoutAlign::Stretch) {
+        } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
             childW = std::clamp(availW, child->minW, child->maxW);
         } else {
             float hintW = child->SizeHint().width;
@@ -559,7 +650,7 @@ void VBoxWidget::DoLayout() {
         }
 
         float childX = cx + child->marginL;
-        switch (crossAlign_) {
+        switch (effAlign) {
             case LayoutAlign::Stretch:
             case LayoutAlign::Start:   break;
             case LayoutAlign::Center:  childX += (availW - childW) * 0.5f; break;
@@ -577,11 +668,15 @@ void VBoxWidget::DoLayout() {
         auto hint = child->SizeHint();
         float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : cw);
         float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : 24.0f);
+        float pl = ResolveAbsSide(child->posLeftRaw,   child->posLeft,   cw);
+        float pr = ResolveAbsSide(child->posRightRaw,  child->posRight,  cw);
+        float pt = ResolveAbsSide(child->posTopRaw,    child->posTop,    totalH);
+        float pb = ResolveAbsSide(child->posBottomRaw, child->posBottom, totalH);
         float x = cx, y2 = cy;
-        if (child->posLeft >= 0) x = cx + child->posLeft;
-        else if (child->posRight >= 0) x = cx + cw - w - child->posRight;
-        if (child->posTop >= 0) y2 = cy + child->posTop;
-        else if (child->posBottom >= 0) y2 = cy + totalH - h - child->posBottom;
+        if (pl >= 0) x = cx + pl;
+        else if (pr >= 0) x = cx + cw - w - pr;
+        if (pt >= 0) y2 = cy + pt;
+        else if (pb >= 0) y2 = cy + totalH - h - pb;
         child->rect = {x, y2, x + w, y2 + h};
         child->DoLayout();
     }
@@ -699,12 +794,22 @@ void HBoxWidget::DoLayout() {
 
         x += child->marginL;
 
-        // Cross-axis (height + vertical position)
+        // Cross-axis (height + vertical position). align-self overrides
+        // container's align-items per-child when set.
+        LayoutAlign effAlign = (child->alignSelfOverride < 0)
+            ? crossAlign_
+            : static_cast<LayoutAlign>(child->alignSelfOverride);
+        // CSS display: inline / inline-block items have intrinsic cross-size
+        // and don't honor align-items: stretch (use SizeHint instead). User
+        // explicit align-self: stretch opt-in still wins.
+        bool intrinsic = (child->display == Display::Inline ||
+                          child->display == Display::InlineBlock) &&
+                         child->alignSelfOverride < 0;
         float availH = ch - child->marginT - child->marginB;
         float childH;
         if (child->fixedH > 0) {
             childH = std::clamp(child->fixedH, child->minH, child->maxH);
-        } else if (crossAlign_ == LayoutAlign::Stretch) {
+        } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
             childH = std::clamp(availH, child->minH, child->maxH);
         } else {
             float hintH = child->SizeHint().height;
@@ -713,7 +818,7 @@ void HBoxWidget::DoLayout() {
         }
 
         float childY = cy + child->marginT;
-        switch (crossAlign_) {
+        switch (effAlign) {
             case LayoutAlign::Stretch:
             case LayoutAlign::Start:   break;
             case LayoutAlign::Center:  childY += (availH - childH) * 0.5f; break;
@@ -731,11 +836,15 @@ void HBoxWidget::DoLayout() {
         auto hint = child->SizeHint();
         float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : totalW);
         float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : ch);
+        float pl = ResolveAbsSide(child->posLeftRaw,   child->posLeft,   totalW);
+        float pr = ResolveAbsSide(child->posRightRaw,  child->posRight,  totalW);
+        float pt = ResolveAbsSide(child->posTopRaw,    child->posTop,    ch);
+        float pb = ResolveAbsSide(child->posBottomRaw, child->posBottom, ch);
         float x2 = cx, y2 = cy;
-        if (child->posLeft >= 0) x2 = cx + child->posLeft;
-        else if (child->posRight >= 0) x2 = cx + totalW - w - child->posRight;
-        if (child->posTop >= 0) y2 = cy + child->posTop;
-        else if (child->posBottom >= 0) y2 = cy + ch - h - child->posBottom;
+        if (pl >= 0) x2 = cx + pl;
+        else if (pr >= 0) x2 = cx + totalW - w - pr;
+        if (pt >= 0) y2 = cy + pt;
+        else if (pb >= 0) y2 = cy + ch - h - pb;
         child->rect = {x2, y2, x2 + w, y2 + h};
         child->DoLayout();
     }
@@ -844,18 +953,26 @@ void HBoxWidget::DoLayoutWrap() {
             float w = widths[i];
             x += child->marginL;
 
-            // Cross-axis (height + vertical position within row)
+            // Cross-axis (height + vertical position within row). align-self
+            // overrides container's align-items per-child when set.
+            LayoutAlign effAlign = (child->alignSelfOverride < 0)
+                ? crossAlign_
+                : static_cast<LayoutAlign>(child->alignSelfOverride);
+            // CSS display: inline / inline-block — see no-wrap path comment.
+            bool intrinsic = (child->display == Display::Inline ||
+                              child->display == Display::InlineBlock) &&
+                             child->alignSelfOverride < 0;
             float availH = row.maxH - child->marginT - child->marginB;
             float childH;
             if (child->fixedH > 0) {
                 childH = std::clamp(child->fixedH, child->minH, child->maxH);
-            } else if (crossAlign_ == LayoutAlign::Stretch) {
+            } else if (effAlign == LayoutAlign::Stretch && !intrinsic) {
                 childH = std::clamp(availH, child->minH, child->maxH);
             } else {
                 childH = std::clamp(heights[i], child->minH, child->maxH);
             }
             float childY = y + child->marginT;
-            switch (crossAlign_) {
+            switch (effAlign) {
                 case LayoutAlign::Stretch:
                 case LayoutAlign::Start:   break;
                 case LayoutAlign::Center:  childY += (availH - childH) * 0.5f; break;
@@ -875,11 +992,15 @@ void HBoxWidget::DoLayoutWrap() {
         auto hint = child->SizeHint();
         float w = child->fixedW > 0 ? child->fixedW : (hint.width > 0 ? hint.width : totalW);
         float h = child->fixedH > 0 ? child->fixedH : (hint.height > 0 ? hint.height : ch);
+        float pl = ResolveAbsSide(child->posLeftRaw,   child->posLeft,   totalW);
+        float pr = ResolveAbsSide(child->posRightRaw,  child->posRight,  totalW);
+        float pt = ResolveAbsSide(child->posTopRaw,    child->posTop,    ch);
+        float pb = ResolveAbsSide(child->posBottomRaw, child->posBottom, ch);
         float x2 = cx, y2 = cy;
-        if (child->posLeft >= 0) x2 = cx + child->posLeft;
-        else if (child->posRight >= 0) x2 = cx + totalW - w - child->posRight;
-        if (child->posTop >= 0) y2 = cy + child->posTop;
-        else if (child->posBottom >= 0) y2 = cy + ch - h - child->posBottom;
+        if (pl >= 0) x2 = cx + pl;
+        else if (pr >= 0) x2 = cx + totalW - w - pr;
+        if (pt >= 0) y2 = cy + pt;
+        else if (pb >= 0) y2 = cy + ch - h - pb;
         child->rect = {x2, y2, x2 + w, y2 + h};
         child->DoLayout();
     }

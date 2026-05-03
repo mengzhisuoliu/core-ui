@@ -487,13 +487,33 @@ void CompileElement(CompilerCtx& ctx,
             rawW->boxShadow.set = false;
             rawW->boxShadows.clear();
             rawW->hasBgGradient = false;
+            rawW->bgGradients.clear();
             rawW->rotateDeg = 0.0f;
             rawW->scaleX = 1.0f;
             rawW->scaleY = 1.0f;
             rawW->transformX = 0.0f;
             rawW->transformY = 0.0f;
             rawW->overflowHidden = false;
+            // Reset flex-container fields so a class toggle that removes a
+            // gap/justify-content/align-items rule actually clears the value
+            // (Apply* functions only set on s.Has(prop)). Container type
+            // (VBox vs HBox) is locked at factory time and can't change here.
+            if (auto* vb = dynamic_cast<VBoxWidget*>(rawW)) {
+                vb->Gap(0);
+                vb->MainJustify(LayoutJustify::Start);
+                vb->CrossAlign(LayoutAlign::Stretch);
+            } else if (auto* hb = dynamic_cast<HBoxWidget*>(rawW)) {
+                hb->Gap(0);
+                hb->MainJustify(LayoutJustify::Start);
+                hb->CrossAlign(LayoutAlign::Stretch);
+                hb->FlexWrap(false);
+            }
+            // Reset flex-item fields (expanding/flex from flex-grow / flex shorthand)
+            rawW->expanding = false;
+            rawW->flex = 1.0f;
             ApplyCommonStyle(*rawW, s);
+            ApplyFlexContainerStyle(*rawW, s);
+            ApplyFlexItemStyle(*rawW, s);
             // SVG-specific reactive hook: re-run the CSS-to-shape pipeline
             // so :hover / .sel descendant selectors flip path fill at runtime.
             if (auto* svg = dynamic_cast<SvgWidget*>(rawW)) {

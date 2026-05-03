@@ -121,31 +121,35 @@ static void appendTextMetrics(std::ostringstream& ss, const std::string& ind,
 static void appendTypeProps(std::ostringstream& ss, Widget* w, int d, Renderer* r) {
     std::string ind = indent(d);
     float cw = w->rect.right - w->rect.left;  // content width approx
+    // Per-widget font size — CSS-set value if any, otherwise theme default.
+    // Hardcoding kFontSizeNormal misled textWidth measurements when the CSS
+    // overrode font-size (e.g. .badge label { font-size: 12px }).
+    float fs = (w->css.fontSize > 0) ? w->css.fontSize : theme::kFontSizeNormal;
 
     if (auto* lbl = dynamic_cast<LabelWidget*>(w)) {
         ss << ",\n" << ind << "\"text\": " << jsonStr(lbl->Text());
         float pad = w->padL + w->padR;
-        appendTextMetrics(ss, ind, r, lbl->Text(), theme::kFontSizeNormal, cw - pad);
+        appendTextMetrics(ss, ind, r, lbl->Text(), fs, cw - pad);
     }
     else if (auto* btn = dynamic_cast<ButtonWidget*>(w)) {
         ss << ",\n" << ind << "\"text\": " << jsonStr(btn->Text());
-        appendTextMetrics(ss, ind, r, btn->Text(), theme::kFontSizeNormal, cw - 24.0f);
+        appendTextMetrics(ss, ind, r, btn->Text(), fs, cw - 24.0f);
     }
     else if (auto* cb = dynamic_cast<CheckBoxWidget*>(w)) {
         ss << ",\n" << ind << "\"text\": " << jsonStr(cb->Text());
         ss << ",\n" << ind << "\"checked\": " << (cb->Checked() ? "true" : "false");
-        appendTextMetrics(ss, ind, r, cb->Text(), theme::kFontSizeNormal, cw - 26.0f);
+        appendTextMetrics(ss, ind, r, cb->Text(), fs, cw - 26.0f);
     }
     else if (auto* rb = dynamic_cast<RadioButtonWidget*>(w)) {
         ss << ",\n" << ind << "\"text\": " << jsonStr(rb->Text());
         ss << ",\n" << ind << "\"selected\": " << (rb->Selected() ? "true" : "false");
         ss << ",\n" << ind << "\"group\": " << jsonStr(rb->Group());
-        appendTextMetrics(ss, ind, r, rb->Text(), theme::kFontSizeNormal, cw - 26.0f);
+        appendTextMetrics(ss, ind, r, rb->Text(), fs, cw - 26.0f);
     }
     else if (auto* tg = dynamic_cast<ToggleWidget*>(w)) {
         ss << ",\n" << ind << "\"text\": " << jsonStr(tg->Text());
         ss << ",\n" << ind << "\"on\": " << (tg->On() ? "true" : "false");
-        appendTextMetrics(ss, ind, r, tg->Text(), theme::kFontSizeNormal, cw - 44.0f);
+        appendTextMetrics(ss, ind, r, tg->Text(), fs, cw - 44.0f);
     }
     else if (auto* sl = dynamic_cast<SliderWidget*>(w)) {
         ss << ",\n" << ind << "\"value\": " << jsonFloat(sl->Value());

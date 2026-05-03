@@ -833,7 +833,7 @@ dev 工作流（边改边看）：
 
 ```c
 ui_init();
-ui_asset_register_dir("C:/path/to/myapp/assets");   // <img src="logo.png"> → assets/logo.png
+ui_asset_register_dir("E:/myapp/assets");   // <img src="logo.png"> → assets/logo.png
 UiPage p = ui_page_load_file(L"app.uix");
 ui_run();
 ```
