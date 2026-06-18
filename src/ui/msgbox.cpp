@@ -33,6 +33,11 @@ struct BoxState {
     int  defaultIdx = 0;
     int  cancelIdx  = -1;
     UiWindow win = 0;
+    std::vector<int>          buttonKeys;   /* 每按钮 VK 绑定 (build 172); 空/0=无 */
+    std::wstring              title;        /* IPC dialog_state 快照用 */
+    std::vector<std::wstring> buttons;
+    std::vector<UiWidget>     btnWidgets;   /* build 174: 按钮 widget, 方向键移焦点用 */
+    int                       focusedBtnIdx = -1;
 
     void Finish(int r) {
         result = r;
@@ -44,6 +49,10 @@ struct BoxState {
     }
 };
 
+/* 当前活动 msgbox (模态唯一; 嵌套时 Show 内 save/restore 成栈)。仅 UI 线程访问
+ * (Show / OnKey / IPC invoke_sync 全在 UI 线程) → 无需加锁。build 172 IPC 自动化。 */
+BoxState* g_activeBox = nullptr;
+
 struct BtnCtx {
     BoxState* state;
     int       idx;
@@ -54,11 +63,38 @@ void OnBtnClick(UiWidget /*w*/, void* ud) {
     if (c && c->state) c->state->Finish(c->idx);
 }
 
-void OnKey(UiWindow /*win*/, int vk, void* ud) {
+/* build 174: 按钮获得焦点 → 同步 focusedBtnIdx (覆盖 Tab / 方向键 / 鼠标点击各路径,
+ * 让方向键导航从实际焦点处继续)。 */
+void OnBtnFocus(UiWidget /*w*/, void* ud) {
+    auto* c = static_cast<BtnCtx*>(ud);
+    if (c && c->state) c->state->focusedBtnIdx = c->idx;
+}
+
+void OnKey(UiWindow win, int vk, void* ud) {
     auto* s = static_cast<BoxState*>(ud);
     if (!s) return;
+    /* build 172: 每按钮快捷键优先 — 命中 button_keys 即触发该按钮 (含覆盖 Enter)。 */
+    for (size_t i = 0; i < s->buttonKeys.size(); ++i) {
+        if (s->buttonKeys[i] != 0 && s->buttonKeys[i] == vk) { s->Finish((int)i); return; }
+    }
+    /* build 174: ←/→ 在按钮间移焦点 (循环)。注: 此回调仅在 DispatchKeyDown 未消费时
+     * 触发 —— 聚焦按钮的 Enter/Space 已被内置激活 (onClick→Finish), Left/Right 对
+     * 按钮内置不处理故落到这里。布局 btnWidgets[0..n-1] 左→右。 */
+    if ((vk == VK_LEFT || vk == VK_RIGHT) && !s->btnWidgets.empty()) {
+        const int n = (int)s->btnWidgets.size();
+        int target;
+        if (s->focusedBtnIdx < 0 || s->focusedBtnIdx >= n) {
+            /* 首次方向键: 焦点现身于 default_idx (安全默认), 不移动。 */
+            target = (s->defaultIdx >= 0 && s->defaultIdx < n) ? s->defaultIdx : 0;
+        } else {
+            target = (vk == VK_RIGHT) ? (s->focusedBtnIdx + 1) % n
+                                      : (s->focusedBtnIdx - 1 + n) % n;
+        }
+        ui_window_focus_widget(win, s->btnWidgets[target]);  /* on_focus 同步 focusedBtnIdx */
+        return;
+    }
     if (vk == VK_ESCAPE && s->cancelIdx >= 0) s->Finish(s->cancelIdx);
-    else if (vk == VK_RETURN) s->Finish(s->defaultIdx);
+    else if (vk == VK_RETURN) s->Finish(s->focusedBtnIdx >= 0 ? s->focusedBtnIdx : s->defaultIdx);
 }
 
 void OnClose(uint64_t /*win*/, void* ud) {
@@ -98,7 +134,8 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
                             int default_idx, int cancel_idx, int icon,
                             const std::wstring& check_text,
                             int check_initial,
-                            const UiColor* btn_colors) {
+                            const UiColor* btn_colors,
+                            const std::vector<int>& button_keys) {
     UiMsgBoxResult res{};
     res.button  = cancel_idx;
     res.checked = check_initial ? 1 : 0;
@@ -177,6 +214,9 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
     state.defaultIdx = default_idx;
     state.cancelIdx  = cancel_idx;
     state.win        = win;
+    state.buttonKeys = button_keys;        /* build 172: 每按钮快捷键 */
+    state.title      = title;              /* IPC dialog_state 快照 */
+    state.buttons    = buttons;
 
     /* ---- widget 树 ---- */
     UiWidget root = ui_vbox();
@@ -242,7 +282,9 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
         }
         btnCtx[i] = {&state, (int)i};
         ui_widget_on_click(b, &OnBtnClick, &btnCtx[i]);
+        ui_widget_on_focus(b, &OnBtnFocus, &btnCtx[i]);  /* build 174: 同步 focusedBtnIdx */
         ui_widget_add_child(btnRow, b);
+        state.btnWidgets.push_back(b);   /* build 174: 方向键移焦点用 */
     }
     ui_widget_add_child(body, btnRow);
 
@@ -260,11 +302,22 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
         SetFocus(h);
     }
 
+    /* build 172: 注册为当前活动 msgbox (IPC 自动化驱动)。嵌套时 save/restore 成栈。
+     * 同线程访问, 无需锁。 */
+    BoxState* prevActive = g_activeBox;
+    g_activeBox = &state;
+
+    /* build 174: 开框默认不显焦点 (focusedBtnIdx=-1, 无焦点环) —— 鼠标用户不该看到
+     * 焦点环。回车在无焦点时走 OnKey 兜底=default_idx (调用方设成"取消"=安全)。首次
+     * 方向键 / Tab 才让焦点现身 (方向键见 OnKey: 现身于 default_idx; Tab 走内置
+     * FocusNext + 亮环)。default_idx 按钮的 accent 主样式仍在, 标示默认动作。 */
+
     MSG m;
     while (!state.done && GetMessageW(&m, nullptr, 0, 0)) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    g_activeBox = prevActive;
     if (!state.done) {
         /* WM_QUIT 流到这 — 转回外层泵, 按取消收场。 */
         PostQuitMessage((int)m.wParam);
@@ -280,6 +333,30 @@ UiMsgBoxResult MsgBox::Show(UiWindow parent,
     ui_window_destroy(win);
     res.button = state.result;
     return res;
+}
+
+// ---- IPC 自动化钩子 (build 172) — 仅 UI 线程调 (debug server invoke_sync) ----
+
+MsgBoxDebugInfo MsgBoxDebugSnapshot() {
+    MsgBoxDebugInfo info;
+    if (BoxState* s = g_activeBox) {
+        info.active       = true;
+        info.default_idx  = s->defaultIdx;
+        info.cancel_idx   = s->cancelIdx;
+        info.button_count = (int)s->buttons.size();
+        info.focused_idx  = s->focusedBtnIdx;
+        info.title        = s->title;
+        info.buttons      = s->buttons;
+    }
+    return info;
+}
+
+bool MsgBoxDebugFinish(int idx) {
+    if (BoxState* s = g_activeBox) {
+        s->Finish(idx);   /* idx 越界(如 cancel=-1)= 关闭按取消收场, 等价 OnClose */
+        return true;
+    }
+    return false;
 }
 
 }  // namespace ui

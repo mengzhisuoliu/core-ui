@@ -10,6 +10,7 @@
 #include "ui_window.h"
 #include "controls.h"
 #include "gh_img_view.h"
+#include "msgbox.h"            /* build 172: dialog_* IPC 自动化 → MsgBoxDebug* */
 #include "../../include/ui_core.h"
 
 #include <atomic>
@@ -83,6 +84,33 @@ std::wstring utf8ToWide(const std::string& s) {
     std::wstring w(n, 0);
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), w.data(), n);
     return w;
+}
+
+std::string wideToUtf8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), s.data(), n, nullptr, nullptr);
+    return s;
+}
+
+/* 最小 JSON 字符串转义 (引号/反斜杠/控制符)。 */
+std::string jsonEscape(const std::string& s) {
+    std::string o;
+    o.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  o += "\\\""; break;
+            case '\\': o += "\\\\"; break;
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            default:
+                if (c < 0x20) { char b[8]; std::snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+                else o += (char)c;
+        }
+    }
+    return o;
 }
 
 int parseVk(const std::string& s) {
@@ -580,6 +608,49 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         return okJson();
     }
 
+    // --- 模态对话框 (ui_msgbox) IPC 自动化 (build 172) ---
+    // DispatchOnce 整体经 ui_window_invoke_sync 在 UI 线程跑 (模态 GetMessage(NULL)
+    // loop 会 pump 该 invoke), 故此处可直接调 MsgBoxDebug* (同线程访问 g_activeBox)。
+    if (cmd == "dialog_state") {
+        ui::MsgBoxDebugInfo info = ui::MsgBoxDebugSnapshot();
+        if (!info.active) return errJson("no active dialog");
+        std::string j = "{\"ok\":true,\"active\":true";
+        j += ",\"default_idx\":" + std::to_string(info.default_idx);
+        j += ",\"cancel_idx\":"  + std::to_string(info.cancel_idx);
+        j += ",\"button_count\":" + std::to_string(info.button_count);
+        j += ",\"focused_idx\":" + std::to_string(info.focused_idx);
+        j += ",\"title\":\"" + jsonEscape(wideToUtf8(info.title)) + "\"";
+        j += ",\"buttons\":[";
+        for (size_t i = 0; i < info.buttons.size(); ++i) {
+            if (i) j += ",";
+            j += "\"" + jsonEscape(wideToUtf8(info.buttons[i])) + "\"";
+        }
+        j += "]}";
+        return j;
+    }
+    if (cmd == "dialog_confirm") {
+        ui::MsgBoxDebugInfo info = ui::MsgBoxDebugSnapshot();
+        if (!info.active) return errJson("no active dialog");
+        ui::MsgBoxDebugFinish(info.default_idx);   /* = Enter 绑定的 default 按钮 */
+        return okJson();
+    }
+    if (cmd == "dialog_cancel") {
+        ui::MsgBoxDebugInfo info = ui::MsgBoxDebugSnapshot();
+        if (!info.active) return errJson("no active dialog");
+        if (info.cancel_idx < 0) return errJson("dialog is not cancelable");
+        ui::MsgBoxDebugFinish(info.cancel_idx);
+        return okJson();
+    }
+    if (cmd == "dialog_click") {
+        if (arg(0).empty()) return errJson("usage: dialog_click <idx>");
+        ui::MsgBoxDebugInfo info = ui::MsgBoxDebugSnapshot();
+        if (!info.active) return errJson("no active dialog");
+        int idx = std::atoi(arg(0).c_str());
+        if (idx < 0 || idx >= info.button_count) return errJson("button index out of range");
+        ui::MsgBoxDebugFinish(idx);
+        return okJson();
+    }
+
     // --- HWND channel (PostMessage) ---
     if (cmd == "post_click") {
         if (arg(1).empty()) return errJson("usage: post_click <x> <y>");
@@ -628,7 +699,7 @@ std::string BuiltinDispatch(UiWindow win, const std::string& cmd,
         "\"menu_open_submenu i0/i1/...\",\"screenshot_submenu i0/i1/... <out>\","
         "\"menu_count_at [path]\",\"menu_has_sub path\",\"menu_id_at path\","
         "\"menu_autoclose 0|1\","
-        "\"dialog_confirm\",\"dialog_cancel\","
+        "\"dialog_confirm\",\"dialog_cancel\",\"dialog_click <idx>\",\"dialog_state\","
         "\"post_click <x> <y>\",\"post_rclick <x> <y>\","
         "\"post_key <vk|name>\",\"post_char <cp>\""
         "]}";

@@ -266,6 +266,13 @@ typedef struct UiMsgBoxParams {
      * struct_size 护栏: 旧编译的调用方 (不含本字段的 sizeof) 仍合法 —
      * 实现按 struct_size 判定字段可用性。 */
     const UiColor* button_colors;
+    /* 每按钮快捷键绑定 (build 172): NULL = 不绑 (仍走 default_idx=Enter /
+     * cancel_idx=Esc)。数组长度 = button_count, 元素为 Win32 VK 键码 (如
+     * VK_RETURN/VK_ESCAPE/'Y'/'N'), 0 = 该按钮无绑定。按某键即触发绑该键的
+     * 按钮 (按数组顺序取首个命中); button_keys 优先于 default_idx/cancel_idx 的
+     * Enter/Esc 兜底。供"是=Y/否=N"类多按钮对话框 + IPC dialog_key 自动化。
+     * struct_size 护栏同 button_colors。 */
+    const int* button_keys;
 } UiMsgBoxParams;
 
 typedef struct UiMsgBoxResult {
@@ -834,6 +841,10 @@ UI_API void ui_widget_on_focus(UiWidget w,
 UI_API void ui_widget_on_blur (UiWidget w,
                                 UiWidgetFocusCallback cb,
                                 void* userdata);
+
+/* build 174: 编程式把键盘焦点设到 widget w (并亮焦点环, 视同键盘导航)。w=0 清焦点。
+ * 供模态对话框初始焦点落在按钮上 + 方向键移焦点 (msgbox)。 */
+UI_API void ui_window_focus_widget(UiWindow win, UiWidget w);
 
 /* Build 66+ (L16): widget 滚轮回调. 任意 widget 类型可挂 — 之前
  * ui_custom_on_mouse_wheel 只对 CustomWidget 生效, 而且 lib 的 OnMouseWheel

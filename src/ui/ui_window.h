@@ -284,6 +284,10 @@ public:
     /* Focused widget accessor for debug API */
     Widget* FocusedWidget() const { return focusedWidget_; }
 
+    /* build 174: 编程式设焦点 + 亮焦点环 (键盘导航可见)。供 ui_window_focus_widget
+     * C API (msgbox 初始焦点落在按钮上 + 方向键移焦点用)。w=null 清焦点。 */
+    void FocusWidget(Widget* w);
+
     // Called from ui::Context::NotifyWidgetDestroyed when a widget dies
     // unexpectedly (v-for iter destroyed while cursor on it).
     void NotifyWidgetDestroyed(class Widget* w);

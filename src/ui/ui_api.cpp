@@ -196,6 +196,11 @@ UI_API void ui_window_invalidate(UiWindow win) {
     if (w) w->Invalidate();
 }
 
+UI_API void ui_window_focus_widget(UiWindow win, UiWidget widget) {
+    auto* w = Win(win);
+    if (w) w->FocusWidget(widget ? W(widget) : nullptr);
+}
+
 UI_API void ui_window_relayout(UiWindow win) {
     auto* w = Win(win);
     if (w) { w->LayoutRoot(); w->Invalidate(); }
@@ -488,11 +493,17 @@ UI_API UiMsgBoxResult ui_msgbox_ex(UiWindow win, const UiMsgBoxParams* p) {
     const UiColor* colors =
         field_avail(offsetof(UiMsgBoxParams, button_colors) + sizeof(void*))
             ? p->button_colors : nullptr;
+    /* build 172: 每按钮快捷键 (struct_size 护栏 — 旧调用方不含此字段仍合法)。 */
+    std::vector<int> btn_keys;
+    if (field_avail(offsetof(UiMsgBoxParams, button_keys) + sizeof(void*))
+        && p->button_keys) {
+        btn_keys.assign(p->button_keys, p->button_keys + n);
+    }
     return ui::MsgBox::Show(
         win,
         p->title ? p->title : L"", p->message ? p->message : L"",
         btns, p->default_idx, p->cancel_idx, p->icon,
-        check_text ? check_text : L"", check_initial, colors);
+        check_text ? check_text : L"", check_initial, colors, btn_keys);
 }
 
 // ================================================================

@@ -32,7 +32,23 @@ public:
                                int default_idx, int cancel_idx, int icon,
                                const std::wstring& check_text,
                                int check_initial,
-                               const UiColor* btn_colors);  /* 可 NULL */
+                               const UiColor* btn_colors,        /* 可 NULL */
+                               const std::vector<int>& button_keys = {});  /* 每按钮 VK 绑定; 空=无 */
 };
+
+/* ---- IPC 自动化钩子 (build 172) — 让 ui_debug_server 驱动当前活动 msgbox。
+ * 全部必须在 UI 线程调 (debug server 经 ui_window_invoke_sync marshal)。模态
+ * 唯一, 故"当前活动"就是栈顶那个 (支持嵌套)。 */
+struct MsgBoxDebugInfo {
+    bool active = false;
+    int  default_idx = 0;
+    int  cancel_idx  = -1;
+    int  button_count = 0;
+    int  focused_idx = -1;        /* build 174: 当前键盘焦点按钮 (-1=无) */
+    std::wstring title;
+    std::vector<std::wstring> buttons;
+};
+MsgBoxDebugInfo MsgBoxDebugSnapshot();   /* 当前活动 msgbox 快照 (active=false=无)。 */
+bool MsgBoxDebugFinish(int idx);          /* 触发 idx 按钮 (等价点击); 无活动返 false。 */
 
 }  // namespace ui

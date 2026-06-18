@@ -2324,6 +2324,14 @@ void UiWindowImpl::ClearFocus() {
     SetFocus(nullptr);
 }
 
+void UiWindowImpl::FocusWidget(Widget* w) {
+    SetFocus(w);
+    /* 亮焦点环 — 编程式设焦点视同键盘导航 (让用户看见焦点落在哪个按钮)。 */
+    showFocusRing_ = true;
+    ShowFocusRing() = true;
+    Invalidate();
+}
+
 void UiWindowImpl::FocusNext(bool reverse) {
     if (!root_ || !tabNavigationEnabled_) return;
     std::vector<Widget*> chain;
